@@ -1,0 +1,15 @@
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+DATA_DIR = PROJECT_ROOT / "data"
+DATABASE_PATH = DATA_DIR / "cryptosafe.db"
+
+ENCRYPTION_ALGORITHM = "AES-256-GCM"
+ENCRYPTION_PLACEHOLDER = True
+
+DEFAULT_CLIPBOARD_TIMEOUT = 30
+DEFAULT_AUTO_LOCK_TIMEOUT = 300
+
+APP_ENV = "development"
