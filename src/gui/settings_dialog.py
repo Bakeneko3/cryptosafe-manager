@@ -1,18 +1,26 @@
 import tkinter as tk
 from tkinter import ttk
+from src.core.settings_manager import SettingsManager
 
 
 class SettingsDialog(tk.Toplevel):
-    def __init__(self, master=None):
+    def __init__(
+        self,
+        master=None,
+        settings_manager: SettingsManager | None = None,
+    ):
         super().__init__(master)
 
         self.title("CryptoSafe Manager — Settings")
         self.geometry("550x400")
         self.resizable(False, False)
 
+        self.settings_manager = settings_manager
+        self.result = None
+
         self._create_widgets()
 
-#        self.transient(master)
+        self.transient(master)
 
     def _create_widgets(self):
         notebook = ttk.Notebook(self)
@@ -79,10 +87,7 @@ class SettingsDialog(tk.Toplevel):
             from_=5,
             to=3600,
             textvariable=self.clipboard_timeout,
-        ).pack(
-            fill=tk.X,
-            pady=(5, 20),
-        )
+        ).pack(fill=tk.X, pady=(5, 20))
 
         ttk.Label(
             parent,
@@ -96,10 +101,7 @@ class SettingsDialog(tk.Toplevel):
             from_=30,
             to=86400,
             textvariable=self.auto_lock_timeout,
-        ).pack(
-            fill=tk.X,
-            pady=(5, 20),
-        )
+        ).pack(fill=tk.X, pady=(5, 20))
 
     def _create_appearance_tab(self, parent):
         ttk.Label(
@@ -169,6 +171,10 @@ class SettingsDialog(tk.Toplevel):
             "language": self.language.get(),
             "backup_enabled": self.backup_enabled.get(),
         }
+
+        if self.settings_manager is not None:
+            for key, value in self.result.items():
+                self.settings_manager.set(key, value)
 
         self.destroy()
 
