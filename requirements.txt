@@ -1,0 +1,5 @@
+cryptography
+argon2-cffi
+pyperclip
+pytest
+pytest-cov
