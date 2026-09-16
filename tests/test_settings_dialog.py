@@ -41,3 +41,28 @@ def test_settings_dialog_saves_to_database(tmp_path, root):
     assert settings_manager.get("backup_enabled") is False
 
     db.close()
+
+
+def test_settings_dialog_loads_from_database(tmp_path, root):
+    db = Database(tmp_path / "test.db")
+    settings_manager = SettingsManager(db)
+
+    settings_manager.set("clipboard_timeout", 60)
+    settings_manager.set("auto_lock_timeout", 600)
+    settings_manager.set("theme", "Dark")
+    settings_manager.set("language", "Russian")
+    settings_manager.set("backup_enabled", False)
+
+    dialog = SettingsDialog(
+        root,
+        settings_manager=settings_manager,
+    )
+
+    assert dialog.clipboard_timeout.get() == 60
+    assert dialog.auto_lock_timeout.get() == 600
+    assert dialog.theme.get() == "Dark"
+    assert dialog.language.get() == "Russian"
+    assert dialog.backup_enabled.get() is False
+
+    dialog.destroy()
+    db.close()

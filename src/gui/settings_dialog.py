@@ -19,6 +19,7 @@ class SettingsDialog(tk.Toplevel):
         self.result = None
 
         self._create_widgets()
+        self._load_settings()
 
         self.transient(master)
 
@@ -177,6 +178,26 @@ class SettingsDialog(tk.Toplevel):
                 self.settings_manager.set(key, value)
 
         self.destroy()
+
+    def _load_settings(self) -> None:
+        if self.settings_manager is None:
+            return
+
+        self.clipboard_timeout.set(
+            self.settings_manager.get("clipboard_timeout", 30)
+        )
+        self.auto_lock_timeout.set(
+            self.settings_manager.get("auto_lock_timeout", 300)
+        )
+        self.theme.set(
+            self.settings_manager.get("theme", "System")
+        )
+        self.language.set(
+            self.settings_manager.get("language", "English")
+        )
+        self.backup_enabled.set(
+            self.settings_manager.get("backup_enabled", True)
+        )
 
 
 if __name__ == "__main__":

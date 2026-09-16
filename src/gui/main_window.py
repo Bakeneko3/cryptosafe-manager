@@ -1,3 +1,11 @@
+from src.core.config import DATABASE_PATH
+from src.core.settings_manager import SettingsManager
+from src.database.db import Database
+from src.gui.settings_dialog import SettingsDialog
+
+from src.core.audit_logger import AuditLogger
+from src.core.events import EventBus
+
 import tkinter as tk
 from tkinter import ttk
 
@@ -5,6 +13,9 @@ from tkinter import ttk
 class MainWindow(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+
+        self.database = Database(DATABASE_PATH)
+        self.settings_manager = SettingsManager(self.database)
 
         self.title("CryptoSafe Manager")
         self.geometry("900x600")
@@ -14,6 +25,12 @@ class MainWindow(tk.Tk):
         self._create_main_content()
         self._create_status_bar()
 
+        self.event_bus = EventBus()
+        self.audit_logger = AuditLogger(
+            self.database,
+            self.event_bus,
+        )
+
     def _create_menu(self) -> None:
         menu_bar = tk.Menu(self)
 
@@ -22,7 +39,7 @@ class MainWindow(tk.Tk):
         file_menu.add_command(label="Open", command=self._not_implemented)
         file_menu.add_command(label="Backup", command=self._not_implemented)
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.destroy)
+        file_menu.add_command(label="Exit", command=self._exit)
 
         edit_menu = tk.Menu(menu_bar, tearoff=False)
         edit_menu.add_command(label="Add", command=self._not_implemented)
@@ -31,7 +48,10 @@ class MainWindow(tk.Tk):
 
         view_menu = tk.Menu(menu_bar, tearoff=False)
         view_menu.add_command(label="Logs", command=self._not_implemented)
-        view_menu.add_command(label="Settings", command=self._not_implemented)
+        view_menu.add_command(
+            label="Settings",
+            command=self._open_settings,
+        )
 
         help_menu = tk.Menu(menu_bar, tearoff=False)
         help_menu.add_command(label="About", command=self._show_about)
@@ -103,6 +123,18 @@ class MainWindow(tk.Tk):
             side=tk.BOTTOM,
             fill=tk.X,
         )
+
+    def _open_settings(self) -> None:
+        dialog = SettingsDialog(
+            self,
+            settings_manager=self.settings_manager,
+        )
+
+        self.wait_window(dialog)
+
+    def _exit(self) -> None:
+        self.database.close()
+        self.destroy()
 
     def _not_implemented(self) -> None:
         pass
