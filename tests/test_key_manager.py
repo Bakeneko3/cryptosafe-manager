@@ -334,3 +334,148 @@ def test_manager_works_without_event_bus(
     km.create_vault(STRONG)
     km.lock()
     km.unlock(STRONG)
+
+
+# --------------------------------------------------------------------- #
+# Password change & key rotation (CHANGE-1..4, TEST-5)
+# --------------------------------------------------------------------- #
+
+
+NEW_STRONG = "Another-Strong-Pass-99$"
+
+
+def _insert_dummy_entry(db: Database, title: str, ciphertext: bytes) -> int:
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    cur = db.execute(
+        """
+        INSERT INTO vault_entries
+            (title, username, encrypted_password, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (title, "user", ciphertext, now, now),
+    )
+    return cur.lastrowid
+
+
+def test_change_password_requires_unlocked(km: KeyManager) -> None:
+    km.create_vault(STRONG)
+    km.lock()
+    with pytest.raises(RuntimeError, match="unlocked"):
+        km.change_password(STRONG, NEW_STRONG)
+
+
+def test_change_password_requires_correct_current(km: KeyManager) -> None:
+    km.create_vault(STRONG)
+    with pytest.raises(ValueError, match="Current password"):
+        km.change_password("Wrong-Password-99!", NEW_STRONG)
+
+
+def test_change_password_rejects_weak_new(km: KeyManager) -> None:
+    km.create_vault(STRONG)
+    with pytest.raises(ValueError, match="policy"):
+        km.change_password(STRONG, "weak")
+
+
+def test_change_password_rejects_same_password(km: KeyManager) -> None:
+    km.create_vault(STRONG)
+    with pytest.raises(ValueError, match="differ"):
+        km.change_password(STRONG, STRONG)
+
+
+def test_change_password_updates_key_store(km: KeyManager, db: Database) -> None:
+    km.create_vault(STRONG)
+    old_hash = db.fetch_one(
+        "SELECT key_data FROM key_store WHERE key_type = ?",
+        (KEY_TYPE_AUTH_HASH,),
+    )["key_data"]
+    old_salt = db.fetch_one(
+        "SELECT key_data FROM key_store WHERE key_type = ?",
+        (KEY_TYPE_ENC_SALT,),
+    )["key_data"]
+
+    km.change_password(STRONG, NEW_STRONG)
+
+    new_hash = db.fetch_one(
+        "SELECT key_data FROM key_store WHERE key_type = ?",
+        (KEY_TYPE_AUTH_HASH,),
+    )["key_data"]
+    new_salt = db.fetch_one(
+        "SELECT key_data FROM key_store WHERE key_type = ?",
+        (KEY_TYPE_ENC_SALT,),
+    )["key_data"]
+
+    assert new_hash != old_hash
+    assert bytes(new_salt) != bytes(old_salt)
+
+
+def test_change_password_allows_unlock_with_new(km: KeyManager) -> None:
+    km.create_vault(STRONG)
+    km.change_password(STRONG, NEW_STRONG)
+    km.lock()
+    result = km.unlock(NEW_STRONG)
+    assert result.success is True
+
+
+def test_change_password_blocks_old_password(km: KeyManager) -> None:
+    km.create_vault(STRONG)
+    km.change_password(STRONG, NEW_STRONG)
+    km.lock()
+    result = km.unlock(STRONG)
+    assert result.success is False
+
+
+def test_change_password_re_encrypts_entries(km: KeyManager, db: Database) -> None:
+    """TEST-5 (reduced): entries survive a password change."""
+    from src.core.crypto.placeholder import AES256Placeholder
+
+    km.create_vault(STRONG)
+
+    # Encrypt 10 entries with the current (old) key via a temp service.
+    service = AES256Placeholder(km)
+    plaintexts = [f"secret-{i}".encode("utf-8") for i in range(10)]
+    for i, pt in enumerate(plaintexts):
+        _insert_dummy_entry(db, f"entry-{i}", service.encrypt(pt))
+
+    km.change_password(STRONG, NEW_STRONG)
+
+    # After the change, the cached key is the new one.
+    service_after = AES256Placeholder(km)
+    rows = db.fetch_all("SELECT id, encrypted_password FROM vault_entries ORDER BY id")
+    assert len(rows) == 10
+    for row, expected in zip(rows, plaintexts):
+        decrypted = service_after.decrypt(bytes(row["encrypted_password"]))
+        assert decrypted == expected
+
+
+def test_change_password_atomic_rollback_on_failure(
+    km: KeyManager, db: Database
+) -> None:
+    """
+    If re-encryption fails midway, the DB must roll back and the old
+    password must remain valid (CHANGE-4).
+    """
+    km.create_vault(STRONG)
+
+    # Insert one entry that will not decrypt cleanly (garbage bytes).
+    _insert_dummy_entry(db, "garbage", b"\xff\xff\xff")
+
+    with pytest.raises(Exception):
+        # XOR never fails on arbitrary bytes, so simulate failure by
+        # monkey-patching the service to raise inside re-encryption.
+        original = km._re_encrypt_all_entries
+
+        def boom(old_key, new_key):
+            original(old_key, new_key)
+            raise RuntimeError("simulated failure after first transaction")
+
+        km._re_encrypt_all_entries = boom  # type: ignore[assignment]
+        try:
+            km.change_password(STRONG, NEW_STRONG)
+        finally:
+            km._re_encrypt_all_entries = original  # type: ignore[assignment]
+
+    # key_store must still accept the old password.
+    km.lock()
+    assert km.unlock(STRONG).success is True
+    assert km.unlock(NEW_STRONG).success is False

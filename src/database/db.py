@@ -1,7 +1,8 @@
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
-from typing import Callable
+from typing import Callable, Iterator
 
 
 SCHEMA_VERSION = 2
@@ -37,7 +38,6 @@ class Database:
             version = cursor.fetchone()[0]
 
             if version == 0:
-                # Fresh database: create the current schema directly.
                 self._create_schema()
                 self._set_user_version(SCHEMA_VERSION)
                 self._connection.commit()
@@ -50,7 +50,6 @@ class Database:
                     "Please upgrade the application."
                 )
 
-            # Existing database: apply pending migrations in order.
             while version < SCHEMA_VERSION:
                 migration = self._MIGRATIONS.get(version)
                 if migration is None:
@@ -132,22 +131,6 @@ class Database:
 
     @staticmethod
     def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
-        """
-        Sprint 2 migration.
-
-        Rebuilds key_store with the new schema required by Sprint 2:
-          v1: id, key_type, salt, hash, params
-          v2: id, key_type, key_data, version, created_at
-
-        Existing rows (if any) are preserved by mapping:
-          key_type  -> key_type
-          hash/salt/params (first non-null) -> key_data
-          version   -> 1
-          created_at -> current timestamp
-
-        SQLite does not support DROP COLUMN on older versions, so we
-        rebuild the table following the standard 4-step pattern.
-        """
         cursor = connection.cursor()
 
         cursor.executescript(
@@ -206,6 +189,41 @@ class Database:
         with self._lock:
             cursor = self._connection.execute(query, parameters)
             return cursor.fetchone()
+
+    # ------------------------------------------------------------------ #
+    # Transactions
+    # ------------------------------------------------------------------ #
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """
+        Context manager wrapping a SQLite transaction.
+
+        All statements executed inside the block (via execute_in_transaction
+        or direct connection use) are committed together on success and
+        rolled back on any exception.
+
+        Note: sqlite3 in default isolation mode already wraps DML in a
+        transaction until commit(). We simply control commit/rollback
+        explicitly here.
+        """
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN;")
+            except sqlite3.OperationalError:
+                # Already in a transaction (nested use); proceed.
+                pass
+            try:
+                yield
+            except Exception:
+                self._connection.rollback()
+                raise
+            else:
+                self._connection.commit()
+
+    def execute_in_transaction(self, query: str, parameters: tuple = ()):
+        """Execute a statement without committing (for use inside transaction())."""
+        return self._connection.execute(query, parameters)
 
     def close(self) -> None:
         with self._lock:
