@@ -4,7 +4,7 @@ CryptoSafe Manager is a cross-platform desktop password manager developed as an 
 
 The application is designed to securely store password entries in a local database, provide a graphical user interface, protect sensitive data with modern cryptographic primitives, and maintain an auditable history of security-related actions.
 
-> **Current status:** Sprint 1 — Secure Database + GUI Shell
+> **Current status:** Sprint 2 — Master Password + Key Management
 
 ## Project Vision
 
@@ -59,6 +59,11 @@ cryptosafe-manager/
 ├── src/
 │   ├── core/
 │   │   ├── crypto/
+│   │   │   ├── abstract.py
+│   │   │   ├── authentication.py
+│   │   │   ├── key_derivation.py
+│   │   │   ├── key_storage.py
+│   │   │   └── placeholder.py
 │   │   ├── audit_logger.py
 │   │   ├── config.py
 │   │   ├── events.py
@@ -72,8 +77,11 @@ cryptosafe-manager/
 │   │
 │   └── gui/
 │       ├── widgets/
+│       ├── change_password_dialog.py
+│       ├── login_dialog.py
 │       ├── main_window.py
-│       └── settings_dialog.py
+│       ├── settings_dialog.py
+│       └── setup_wizard.py
 │
 ├── tests/
 │
@@ -90,18 +98,40 @@ cryptosafe-manager/
 
 The application currently uses SQLite.
 
-The Sprint 1 schema contains:
+The schema (version 2) contains:
 
 * `vault_entries` — password-manager entries;
 * `audit_log` — application event history;
 * `settings` — application configuration;
-* `key_store` — placeholder storage for future key-management data.
+* `key_store` — master-password authentication hash, PBKDF2 salt, and versioned KDF parameters.
 
-Database schema versioning is implemented using SQLite `PRAGMA user_version`.
+Database schema versioning is implemented using SQLite `PRAGMA user_version`. Migrations run automatically on startup and preserve existing data.
 
-Sensitive fields are passed through a placeholder encryption service during Sprint 1. The placeholder uses XOR only for architectural testing and **must not be considered secure encryption**.
+Sensitive fields are still passed through a placeholder encryption service (XOR) for architectural testing; this **must not be considered secure encryption**. Real AES-256-GCM encryption will be implemented in Sprint 3.
 
-Real AES-256-GCM encryption will be implemented in Sprint 3.
+## Security Model (Sprint 2)
+
+Master password handling follows these rules:
+
+* The master password itself is **never stored**.
+* An Argon2id hash of the password is stored in `key_store` for verification.
+* A PBKDF2-HMAC-SHA256 key is derived from the password and a unique 16-byte salt to obtain the AES-256 encryption key.
+* The encryption key is held only in memory (`KeyCache`) and is never written to disk.
+* Failed login attempts trigger exponential backoff (1s / 5s / 30s).
+* Password change re-encrypts all vault entries atomically.
+
+Argon2id parameters (configurable in `src/core/config.py`):
+
+* time cost: 3 iterations
+* memory cost: 64 MiB
+* parallelism: 4 lanes
+* hash length: 32 bytes
+
+PBKDF2 parameters:
+
+* iterations: 100,000
+* salt length: 16 bytes
+* key length: 32 bytes (AES-256)
 
 ## Setup
 
@@ -139,6 +169,8 @@ From the project root:
 python -m src.gui.main_window
 ```
 
+On first run, a setup wizard will ask for a master password. On subsequent runs, a login dialog will request the same password to unlock the vault.
+
 ## Run Tests
 
 Run the complete test suite:
@@ -147,11 +179,11 @@ Run the complete test suite:
 python -m pytest -v
 ```
 
-The Sprint 1 test suite currently contains 23 tests.
+The current test suite contains 181 tests.
 
 ## Sprint Roadmap
 
-### Sprint 1 — Secure Database + GUI Shell
+### Sprint 1 — Secure Database + GUI Shell (done)
 
 * project architecture;
 * SQLite database;
@@ -166,15 +198,19 @@ The Sprint 1 test suite currently contains 23 tests.
 * backup/restore stubs;
 * automated tests.
 
-### Sprint 2 — Master Password + Key Management
+### Sprint 2 — Master Password + Key Management (done)
 
 * master password setup;
-* Argon2 key derivation;
-* salt generation;
-* key storage;
-* key loading;
-* key rotation;
-* secure memory handling improvements.
+* Argon2id password hashing;
+* PBKDF2-HMAC-SHA256 encryption key derivation;
+* PBKDF2 salt generation and storage;
+* versioned KDF parameters in `key_store`;
+* secure in-memory key caching with zeroing;
+* exponential backoff on failed logins;
+* login dialog and vault unlock;
+* password change with atomic vault re-encryption;
+* database migration system;
+* expanded test coverage.
 
 ### Sprint 3 — Vault CRUD + AES-256-GCM
 
@@ -215,6 +251,7 @@ The Sprint 1 test suite currently contains 23 tests.
 * inactivity detection;
 * system tray integration;
 * panic mode;
+* OS keychain integration;
 * security and usability improvements.
 
 ### Sprint 8 — Integration, Testing + Documentation
@@ -233,31 +270,37 @@ The Sprint 1 test suite currently contains 23 tests.
 
 Cryptographic functionality is introduced progressively.
 
-Sprint 1 contains intentionally insecure placeholders where required by the architecture. These placeholders are temporary and are explicitly marked in the source code.
+Sprint 1 introduced intentionally insecure placeholders where required by the architecture. Sprint 2 introduced the real master-password and key derivation layer while keeping entry encryption as a placeholder.
 
 The final application will use established cryptographic primitives from maintained libraries rather than custom cryptographic algorithms.
 
 ## Development Status
 
-| Component              | Sprint 1    |
-| ---------------------- | ----------- |
-| SQLite database        | Implemented |
-| Schema versioning      | Implemented |
-| GUI shell              | Implemented |
-| Settings               | Implemented |
-| Event bus              | Implemented |
-| Audit logger           | Implemented |
-| Placeholder encryption | Implemented |
-| Key manager            | Stub        |
-| Backup/restore         | Stub        |
-| Master password        | Planned     |
-| Argon2                 | Planned     |
-| AES-256-GCM            | Planned     |
-| Secure clipboard       | Planned     |
-| Signed audit logs      | Planned     |
-| Import/export          | Planned     |
-| Auto-lock              | Planned     |
-| Packaging              | Planned     |
+| Component              | Sprint 1    | Sprint 2          |
+| ---------------------- | ----------- | ----------------- |
+| SQLite database        | Implemented | Implemented       |
+| Schema versioning      | Implemented | Implemented       |
+| Migration system       | Basic       | Implemented       |
+| GUI shell              | Implemented | Implemented       |
+| Settings               | Implemented | Implemented       |
+| Event bus              | Implemented | Implemented       |
+| Audit logger           | Implemented | Implemented       |
+| Placeholder encryption | Implemented | Implemented       |
+| Key manager            | Stub        | Implemented       |
+| Backup/restore         | Stub        | Stub              |
+| Master password        | Planned     | Implemented       |
+| Argon2id hashing       | Planned     | Implemented       |
+| PBKDF2 key derivation  | Planned     | Implemented       |
+| Key caching            | Planned     | Implemented       |
+| Failed-login backoff   | Planned     | Implemented       |
+| Password change        | Planned     | Implemented       |
+| AES-256-GCM            | Planned     | Planned (Sprint 3)|
+| Secure clipboard       | Planned     | Planned (Sprint 4)|
+| Signed audit logs      | Planned     | Planned (Sprint 5)|
+| Import/export          | Planned     | Planned (Sprint 6)|
+| Auto-lock              | Planned     | Planned (Sprint 7)|
+| OS keychain            | Planned     | Planned (Sprint 7)|
+| Packaging              | Planned     | Planned (Sprint 8)|
 
 ## License
 
