@@ -13,3 +13,59 @@ DEFAULT_CLIPBOARD_TIMEOUT = 30
 DEFAULT_AUTO_LOCK_TIMEOUT = 300
 
 APP_ENV = "development"
+
+
+# --- Sprint 2: Argon2 parameters (HASH-2, SEC-4) ---
+# Argon2id — recommended variant. Secure defaults per OWASP/RFC 9106.
+# NOTE: memory_cost is in KiB (65536 KiB = 64 MiB).
+ARGON2_TIME_COST = 3
+ARGON2_MEMORY_COST = 65536
+ARGON2_PARALLELISM = 4
+ARGON2_HASH_LEN = 32
+ARGON2_SALT_LEN = 16
+
+# Hard upper bounds to prevent DoS via maliciously large settings (SEC-4).
+ARGON2_MAX_TIME_COST = 10
+ARGON2_MAX_MEMORY_COST = 262144  # 256 MiB
+ARGON2_MAX_PARALLELISM = 8
+
+
+# --- Sprint 2: PBKDF2 parameters (KEY-2) ---
+PBKDF2_ITERATIONS = 100_000
+PBKDF2_SALT_LEN = 16
+PBKDF2_KEY_LEN = 32  # AES-256
+
+# Hard upper bound to prevent DoS (SEC-4).
+PBKDF2_MAX_ITERATIONS = 1_000_000
+
+
+# --- Sprint 2: password policy (HASH-4) ---
+PASSWORD_MIN_LENGTH = 12
+PASSWORD_REQUIRE_UPPERCASE = True
+PASSWORD_REQUIRE_LOWERCASE = True
+PASSWORD_REQUIRE_DIGIT = True
+PASSWORD_REQUIRE_SYMBOL = True
+
+
+# --- Sprint 2: authentication / session (AUTH-3, AUTH-4) ---
+# Exponential backoff delays (seconds) by failed attempt count.
+AUTH_BACKOFF_DELAYS = {
+    1: 1,
+    2: 1,
+    3: 5,
+    4: 5,
+    5: 30,
+}
+AUTH_BACKOFF_DEFAULT = 30  # for attempts beyond the table
+
+
+# --- Sprint 2: key cache (CACHE-2) ---
+# Inactivity timeout (seconds) after which the cached key is dropped.
+KEY_CACHE_INACTIVITY_TIMEOUT = 3600  # 1 hour
+# Whether losing window focus should drop the key cache.
+KEY_CACHE_DROP_ON_FOCUS_LOSS = False  # configurable; default off
+
+
+# --- Sprint 2: key_store schema versioning (KEY-3, DB-1) ---
+# Version tag stored alongside key material for future algorithm upgrades.
+KEY_STORE_VERSION = 1
