@@ -1,26 +1,57 @@
+"""
+First-run setup wizard.
+
+Collects the master password (with confirmation) and the database
+location, then initializes a new vault via KeyManager.create_vault().
+
+After this wizard completes successfully, the vault is unlocked and
+the application may proceed to the main window.
+"""
+
+from __future__ import annotations
+
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from src.core.key_manager import KeyManager
 from src.gui.widgets.password_entry import PasswordEntry
 
 
 class SetupWizard(tk.Toplevel):
-    def __init__(self, master=None):
+    """
+    Modal first-run wizard.
+
+    After mainloop, `self.result` is:
+        * True  -- vault created and unlocked
+        * False -- user cancelled or closed the window
+    """
+
+    def __init__(self, master, key_manager: KeyManager) -> None:
         super().__init__(master)
 
-        self.title("CryptoSafe Manager — First Run Setup")
-        self.geometry("500x400")
-        self.resizable(False, False)
+        self.key_manager = key_manager
+        self.result: bool = False
 
-        self.result = None
+        self.title("CryptoSafe Manager — First Run Setup")
+        self.geometry("520x460")
+        self.resizable(False, False)
 
         self._create_widgets()
 
-#        self.transient(master)
-#        self.grab_set()
+        self.transient(master)
+        self.grab_set()
 
-    def _create_widgets(self):
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self.bind("<Escape>", lambda _e: self._on_cancel())
+
+        self.password_entry.focus_set()
+
+    # ------------------------------------------------------------------ #
+    # UI
+    # ------------------------------------------------------------------ #
+
+    def _create_widgets(self) -> None:
         container = ttk.Frame(self, padding=20)
         container.pack(fill=tk.BOTH, expand=True)
 
@@ -36,10 +67,16 @@ class SetupWizard(tk.Toplevel):
         ).pack(anchor=tk.W)
 
         self.password_entry = PasswordEntry(container)
-        self.password_entry.pack(
-            fill=tk.X,
-            pady=(5, 15),
-        )
+        self.password_entry.pack(fill=tk.X, pady=(5, 5))
+
+        ttk.Label(
+            container,
+            text=(
+                "At least 12 characters, with uppercase, lowercase, "
+                "digit and symbol."
+            ),
+            foreground="gray",
+        ).pack(anchor=tk.W, pady=(0, 15))
 
         ttk.Label(
             container,
@@ -47,10 +84,7 @@ class SetupWizard(tk.Toplevel):
         ).pack(anchor=tk.W)
 
         self.confirm_entry = PasswordEntry(container)
-        self.confirm_entry.pack(
-            fill=tk.X,
-            pady=(5, 15),
-        )
+        self.confirm_entry.pack(fill=tk.X, pady=(5, 15))
 
         ttk.Label(
             container,
@@ -61,28 +95,19 @@ class SetupWizard(tk.Toplevel):
         db_frame.pack(fill=tk.X, pady=(5, 15))
 
         self.db_path_var = tk.StringVar(
-            value=str(
-                Path.home() / "cryptosafe.db"
-            )
+            value=str(Path.home() / "cryptosafe.db")
         )
 
         ttk.Entry(
             db_frame,
             textvariable=self.db_path_var,
-        ).pack(
-            side=tk.LEFT,
-            fill=tk.X,
-            expand=True,
-        )
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         ttk.Button(
             db_frame,
             text="Browse",
             command=self._browse_database,
-        ).pack(
-            side=tk.RIGHT,
-            padx=(5, 0),
-        )
+        ).pack(side=tk.RIGHT, padx=(5, 0))
 
         self.encryption_var = tk.StringVar(
             value="AES-256-GCM (placeholder)"
@@ -98,33 +123,36 @@ class SetupWizard(tk.Toplevel):
             textvariable=self.encryption_var,
             values=("AES-256-GCM (placeholder)",),
             state="readonly",
-        ).pack(
-            fill=tk.X,
-            pady=(5, 20),
+        ).pack(fill=tk.X, pady=(5, 20))
+
+        self.status_label = ttk.Label(
+            container,
+            text="",
+            foreground="red",
         )
+        self.status_label.pack(anchor=tk.W)
 
         button_frame = ttk.Frame(container)
-        button_frame.pack(
-            side=tk.BOTTOM,
-            fill=tk.X,
-        )
+        button_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
 
         ttk.Button(
             button_frame,
             text="Cancel",
-            command=self.destroy,
+            command=self._on_cancel,
         ).pack(side=tk.RIGHT)
 
-        ttk.Button(
+        self.create_button = ttk.Button(
             button_frame,
             text="Create Vault",
-            command=self._create_vault,
-        ).pack(
-            side=tk.RIGHT,
-            padx=(0, 10),
+            command=self._on_create,
         )
+        self.create_button.pack(side=tk.RIGHT, padx=(0, 10))
 
-    def _browse_database(self):
+    # ------------------------------------------------------------------ #
+    # Actions
+    # ------------------------------------------------------------------ #
+
+    def _browse_database(self) -> None:
         path = filedialog.asksaveasfilename(
             title="Select database location",
             defaultextension=".db",
@@ -133,46 +161,42 @@ class SetupWizard(tk.Toplevel):
                 ("All files", "*.*"),
             ),
         )
-
         if path:
             self.db_path_var.set(path)
 
-    def _create_vault(self):
+    def _on_create(self) -> None:
         password = self.password_entry.get()
         confirmation = self.confirm_entry.get()
 
         if not password:
-            messagebox.showerror(
-                "Invalid password",
-                "Master password cannot be empty.",
-                parent=self,
-            )
+            self.status_label.configure(text="Password cannot be empty.")
             return
 
         if password != confirmation:
+            self.status_label.configure(text="Passwords do not match.")
+            return
+
+        try:
+            self.key_manager.create_vault(password)
+        except ValueError as exc:
+            self.status_label.configure(text=str(exc))
+            return
+        except Exception as exc:
             messagebox.showerror(
-                "Invalid password",
-                "Passwords do not match.",
+                "Setup failed",
+                f"Unexpected error: {exc}",
                 parent=self,
             )
             return
 
-        self.result = {
-            "master_password": password,
-            "database_path": self.db_path_var.get(),
-            "encryption": self.encryption_var.get(),
-        }
-
+        self.result = True
+        self.grab_release()
         self.destroy()
 
-
-if __name__ == "__main__":
-    root = tk.Tk()
-    root.withdraw()
-
-    wizard = SetupWizard(root)
-    root.wait_window(wizard)
-
-    print(wizard.result)
-
-    root.destroy()
+    def _on_cancel(self) -> None:
+        self.result = False
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
