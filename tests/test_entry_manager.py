@@ -161,3 +161,103 @@ def test_create_entry_fails_when_locked(em: EntryManager, km: KeyManager) -> Non
     km.lock()
     with pytest.raises(VaultOperationError):
         em.create_entry(SAMPLE)
+
+
+# --------------------------------------------------------------------- #
+# get_entry
+# --------------------------------------------------------------------- #
+
+
+def test_get_entry_roundtrip(em: EntryManager) -> None:
+    entry_id = em.create_entry(SAMPLE)
+    loaded = em.get_entry(entry_id)
+
+    assert loaded["id"] == entry_id
+    assert loaded["title"] == SAMPLE["title"]
+    assert loaded["username"] == SAMPLE["username"]
+    assert loaded["password"] == SAMPLE["password"]
+    assert loaded["url"] == SAMPLE["url"]
+    assert loaded["notes"] == SAMPLE["notes"]
+    assert loaded["category"] == SAMPLE["category"]
+    assert loaded["version"] == 1
+    assert "created_at" in loaded
+    assert "updated_at" in loaded
+
+
+def test_get_entry_with_tags(em: EntryManager) -> None:
+    entry_id = em.create_entry({**SAMPLE, "tags": "work,important"})
+    loaded = em.get_entry(entry_id)
+    assert loaded["tags"] == "work,important"
+
+
+def test_get_entry_unknown_id_raises(em: EntryManager) -> None:
+    with pytest.raises(VaultOperationError):
+        em.get_entry("no-such-id")
+
+
+def test_get_entry_error_does_not_leak_existence(em: EntryManager) -> None:
+    """SEC-4: unknown id and locked vault must produce the same error type."""
+    with pytest.raises(VaultOperationError):
+        em.get_entry("no-such-id")
+
+
+def test_get_entry_fails_when_locked(em: EntryManager, km: KeyManager) -> None:
+    entry_id = em.create_entry(SAMPLE)
+    km.lock()
+    with pytest.raises(VaultOperationError):
+        em.get_entry(entry_id)
+
+
+# --------------------------------------------------------------------- #
+# get_all_entries
+# --------------------------------------------------------------------- #
+
+
+def test_get_all_entries_empty(em: EntryManager) -> None:
+    assert em.get_all_entries() == []
+
+
+def test_get_all_entries_returns_all(em: EntryManager) -> None:
+    ids = [em.create_entry({**SAMPLE, "title": f"E{i}"}) for i in range(5)]
+    loaded = em.get_all_entries()
+
+    assert len(loaded) == 5
+    assert {e["id"] for e in loaded} == set(ids)
+
+
+def test_get_all_entries_ordered_by_updated_desc(em: EntryManager) -> None:
+    import time
+    first = em.create_entry({**SAMPLE, "title": "first"})
+    time.sleep(0.01)
+    second = em.create_entry({**SAMPLE, "title": "second"})
+
+    loaded = em.get_all_entries()
+    assert [e["id"] for e in loaded][0] == second
+
+
+def test_get_all_entries_skips_corrupted(db: Database, em: EntryManager, km: KeyManager) -> None:
+    """One corrupted row must not break the whole list."""
+    good = em.create_entry(SAMPLE)
+
+    # Insert a bogus row directly.
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    db.execute(
+        """
+        INSERT INTO vault_entries (id, encrypted_data, created_at, updated_at, tags)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("bogus-id", b"\x00" * 40, now, now, ""),
+    )
+
+    loaded = em.get_all_entries()
+    assert len(loaded) == 1
+    assert loaded[0]["id"] == good
+
+
+def test_get_all_entries_fails_when_locked(em: EntryManager, km: KeyManager) -> None:
+    em.create_entry(SAMPLE)
+    km.lock()
+    # When locked, every row fails to decrypt, so the list is empty
+    # rather than raising.
+    assert em.get_all_entries() == []
