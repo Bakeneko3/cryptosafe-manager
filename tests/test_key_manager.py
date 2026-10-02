@@ -235,3 +235,102 @@ def test_different_vaults_produce_different_keys(
     finally:
         db1.close()
         db2.close()
+
+
+# --------------------------------------------------------------------- #
+# Event publishing (AUTH-2 step 4)
+# --------------------------------------------------------------------- #
+
+
+def test_create_vault_publishes_user_logged_in(
+    db: Database, fast_kd: KeyDerivation
+) -> None:
+    from src.core.events import EventBus, UserLoggedIn
+
+    bus = EventBus()
+    received = []
+    bus.subscribe(UserLoggedIn, lambda e: received.append(e))
+
+    km = KeyManager(db, key_derivation=fast_kd, event_bus=bus)
+    km.create_vault(STRONG)
+
+    assert len(received) == 1
+    assert isinstance(received[0], UserLoggedIn)
+
+
+def test_unlock_publishes_user_logged_in(
+    db: Database, fast_kd: KeyDerivation
+) -> None:
+    from src.core.events import EventBus, UserLoggedIn
+
+    bus = EventBus()
+    received = []
+    bus.subscribe(UserLoggedIn, lambda e: received.append(e))
+
+    km = KeyManager(db, key_derivation=fast_kd, event_bus=bus)
+    km.create_vault(STRONG)
+    km.lock()
+    received.clear()
+
+    km.unlock(STRONG)
+    assert len(received) == 1
+
+
+def test_failed_unlock_does_not_publish(
+    db: Database, fast_kd: KeyDerivation
+) -> None:
+    from src.core.events import EventBus, UserLoggedIn
+
+    bus = EventBus()
+    received = []
+    bus.subscribe(UserLoggedIn, lambda e: received.append(e))
+
+    km = KeyManager(db, key_derivation=fast_kd, event_bus=bus)
+    km.create_vault(STRONG)
+    km.lock()
+    received.clear()
+
+    km.unlock("Wrong-Password-99!")
+    assert received == []
+
+
+def test_lock_publishes_user_logged_out(
+    db: Database, fast_kd: KeyDerivation
+) -> None:
+    from src.core.events import EventBus, UserLoggedOut
+
+    bus = EventBus()
+    received = []
+    bus.subscribe(UserLoggedOut, lambda e: received.append(e))
+
+    km = KeyManager(db, key_derivation=fast_kd, event_bus=bus)
+    km.create_vault(STRONG)
+
+    km.lock()
+    assert len(received) == 1
+    assert received[0].reason == "manual"
+
+
+def test_lock_with_reason(
+    db: Database, fast_kd: KeyDerivation
+) -> None:
+    from src.core.events import EventBus, UserLoggedOut
+
+    bus = EventBus()
+    received = []
+    bus.subscribe(UserLoggedOut, lambda e: received.append(e))
+
+    km = KeyManager(db, key_derivation=fast_kd, event_bus=bus)
+    km.create_vault(STRONG)
+
+    km.lock(reason="auto-lock")
+    assert received[0].reason == "auto-lock"
+
+
+def test_manager_works_without_event_bus(
+    db: Database, fast_kd: KeyDerivation
+) -> None:
+    km = KeyManager(db, key_derivation=fast_kd)
+    km.create_vault(STRONG)
+    km.lock()
+    km.unlock(STRONG)

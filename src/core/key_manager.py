@@ -7,12 +7,13 @@ Wires together:
   * AuthSession     -- login/session/failure tracking
   * BackoffPolicy   -- exponential backoff on failed logins
   * Database        -- key_store persistence
+  * EventBus        -- optional: publishes UserLoggedIn / UserLoggedOut
 
 Public API:
     * is_initialized()         -- has a vault been created?
     * create_vault(password)   -- first-run initialization
     * unlock(password)         -- login, returns (success, backoff_delay)
-    * lock()                   -- lock the vault
+    * lock(reason)             -- lock the vault
     * get_encryption_key()     -- access the cached key (or None)
 
 The master password is never stored. Only the Argon2id hash (for
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from src.core import config
 from src.core.crypto.authentication import (
@@ -34,7 +36,11 @@ from src.core.crypto.authentication import (
 )
 from src.core.crypto.key_derivation import KeyDerivation
 from src.core.crypto.key_storage import KeyCache
+from src.core.events import UserLoggedIn, UserLoggedOut
 from src.database.db import Database
+
+if TYPE_CHECKING:
+    from src.core.events import EventBus
 
 
 # --------------------------------------------------------------------- #
@@ -69,12 +75,14 @@ class KeyManager:
         self,
         database: Database,
         *,
+        event_bus: "EventBus | None" = None,
         key_derivation: KeyDerivation | None = None,
         key_cache: KeyCache | None = None,
         validator: PasswordStrengthValidator | None = None,
         backoff: BackoffPolicy | None = None,
     ) -> None:
         self._db = database
+        self._events = event_bus
         self._kd = key_derivation or KeyDerivation()
         self._cache = key_cache or KeyCache()
         self._validator = validator or PasswordStrengthValidator()
@@ -180,6 +188,8 @@ class KeyManager:
         enc_key = b"\x00" * len(enc_key)  # noqa: F841
 
         self._session.record_login()
+        if self._events is not None:
+            self._events.publish(UserLoggedIn())
 
     # ------------------------------------------------------------------ #
     # Login / logout (AUTH-2, AUTH-3, AUTH-4)
@@ -221,12 +231,16 @@ class KeyManager:
         enc_key = b"\x00" * len(enc_key)  # noqa: F841
 
         self._session.record_login()
+        if self._events is not None:
+            self._events.publish(UserLoggedIn())
         return UnlockResult(success=True, backoff_delay=0)
 
-    def lock(self) -> None:
+    def lock(self, reason: str = "manual") -> None:
         """Lock the vault: hide the cached key and end the session."""
         self._cache.lock()
         self._session.record_logout()
+        if self._events is not None:
+            self._events.publish(UserLoggedOut(reason=reason))
 
     # ------------------------------------------------------------------ #
     # Diagnostics

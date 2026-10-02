@@ -1,4 +1,5 @@
 from collections import defaultdict
+from datetime import datetime
 from typing import Callable, DefaultDict, Type
 
 
@@ -19,11 +20,18 @@ class EntryDeleted(Event):
 
 
 class UserLoggedIn(Event):
-    pass
+    """Published after a successful login."""
+
+    def __init__(self, timestamp: datetime | None = None) -> None:
+        self.timestamp = timestamp or datetime.now()
 
 
 class UserLoggedOut(Event):
-    pass
+    """Published after the user locks the vault or logs out."""
+
+    def __init__(self, timestamp: datetime | None = None, reason: str = "manual") -> None:
+        self.timestamp = timestamp or datetime.now()
+        self.reason = reason
 
 
 class ClipboardCopied(Event):
