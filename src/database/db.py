@@ -5,7 +5,7 @@ from threading import Lock
 from typing import Callable, Iterator
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class Database:
@@ -70,27 +70,27 @@ class Database:
         self._connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS vault_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                username TEXT NOT NULL,
-                encrypted_password BLOB NOT NULL,
-                url TEXT,
-                notes TEXT,
+                id TEXT PRIMARY KEY,
+                encrypted_data BLOB NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 tags TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS deleted_entries (
+                id TEXT PRIMARY KEY,
+                encrypted_data BLOB NOT NULL,
+                deleted_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 action TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
-                entry_id INTEGER,
+                entry_id TEXT,
                 details TEXT,
-                signature BLOB,
-                FOREIGN KEY (entry_id)
-                    REFERENCES vault_entries(id)
-                    ON DELETE SET NULL
+                signature BLOB
             );
 
             CREATE TABLE IF NOT EXISTS settings (
@@ -108,17 +108,20 @@ class Database:
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
+            CREATE INDEX IF NOT EXISTS idx_vault_entries_created_at
+                ON vault_entries(created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_vault_entries_updated_at
+                ON vault_entries(updated_at);
+
+            CREATE INDEX IF NOT EXISTS idx_vault_entries_tags
+                ON vault_entries(tags);
+
             CREATE INDEX IF NOT EXISTS idx_audit_log_entry_id
                 ON audit_log(entry_id);
 
             CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp
                 ON audit_log(timestamp);
-
-            CREATE INDEX IF NOT EXISTS idx_vault_entries_title
-                ON vault_entries(title);
-
-            CREATE INDEX IF NOT EXISTS idx_vault_entries_tags
-                ON vault_entries(tags);
 
             CREATE INDEX IF NOT EXISTS idx_key_store_key_type
                 ON key_store(key_type);
@@ -166,8 +169,93 @@ class Database:
             """
         )
 
+    @staticmethod
+    def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+        """
+        Sprint 3 migration.
+
+        Rebuilds vault_entries with the new per-entry AES-GCM layout
+        (id: TEXT/UUID, encrypted_data: BLOB) and changes
+        audit_log.entry_id to TEXT.
+
+        Any existing rows in vault_entries are dropped: the Sprint 1/2
+        placeholder format is not compatible with the new AES-GCM
+        envelope, and no real user data exists yet (CRUD was not
+        implemented before Sprint 3).
+        """
+        cursor = connection.cursor()
+
+        # Drop and rebuild vault_entries.
+        cursor.execute("DROP TABLE IF EXISTS vault_entries;")
+        cursor.execute(
+            """
+            CREATE TABLE vault_entries (
+                id TEXT PRIMARY KEY,
+                encrypted_data BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                tags TEXT
+            );
+            """
+        )
+
+        # Soft-delete table.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS deleted_entries (
+                id TEXT PRIMARY KEY,
+                encrypted_data BLOB NOT NULL,
+                deleted_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+            """
+        )
+
+        # audit_log.entry_id changes from INTEGER to TEXT. SQLite cannot
+        # ALTER COLUMN TYPE, so rebuild it.
+        cursor.execute("DROP INDEX IF EXISTS idx_audit_log_entry_id;")
+        cursor.execute("DROP INDEX IF EXISTS idx_audit_log_timestamp;")
+        cursor.execute("ALTER TABLE audit_log RENAME TO audit_log_old;")
+        cursor.execute(
+            """
+            CREATE TABLE audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                entry_id TEXT,
+                details TEXT,
+                signature BLOB
+            );
+            """
+        )
+        cursor.execute(
+            """
+            INSERT INTO audit_log (id, action, timestamp, entry_id, details, signature)
+            SELECT id, action, timestamp, entry_id, details, signature
+            FROM audit_log_old;
+            """
+        )
+        cursor.execute("DROP TABLE audit_log_old;")
+
+        # Recreate indexes for the new schema.
+        cursor.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_vault_entries_created_at
+                ON vault_entries(created_at);
+            CREATE INDEX IF NOT EXISTS idx_vault_entries_updated_at
+                ON vault_entries(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_vault_entries_tags
+                ON vault_entries(tags);
+            CREATE INDEX IF NOT EXISTS idx_audit_log_entry_id
+                ON audit_log(entry_id);
+            CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp
+                ON audit_log(timestamp);
+            """
+        )
+
     _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
         1: _migrate_v1_to_v2.__func__,
+        2: _migrate_v2_to_v3.__func__,
     }
 
     # ------------------------------------------------------------------ #
@@ -196,22 +284,10 @@ class Database:
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
-        """
-        Context manager wrapping a SQLite transaction.
-
-        All statements executed inside the block (via execute_in_transaction
-        or direct connection use) are committed together on success and
-        rolled back on any exception.
-
-        Note: sqlite3 in default isolation mode already wraps DML in a
-        transaction until commit(). We simply control commit/rollback
-        explicitly here.
-        """
         with self._lock:
             try:
                 self._connection.execute("BEGIN;")
             except sqlite3.OperationalError:
-                # Already in a transaction (nested use); proceed.
                 pass
             try:
                 yield
@@ -222,7 +298,6 @@ class Database:
                 self._connection.commit()
 
     def execute_in_transaction(self, query: str, parameters: tuple = ()):
-        """Execute a statement without committing (for use inside transaction())."""
         return self._connection.execute(query, parameters)
 
     def close(self) -> None:
