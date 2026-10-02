@@ -7,16 +7,34 @@ class Event:
     """Base class for application events."""
 
 
-class EntryAdded(Event):
-    pass
+class EntryCreated(Event):
+    """Published after a new vault entry has been stored."""
+
+    def __init__(self, entry_id: str, timestamp: datetime | None = None) -> None:
+        self.entry_id = entry_id
+        self.timestamp = timestamp or datetime.now()
 
 
 class EntryUpdated(Event):
-    pass
+    """Published after an existing vault entry has been modified."""
+
+    def __init__(self, entry_id: str, timestamp: datetime | None = None) -> None:
+        self.entry_id = entry_id
+        self.timestamp = timestamp or datetime.now()
 
 
 class EntryDeleted(Event):
-    pass
+    """Published after a vault entry has been deleted (hard or soft)."""
+
+    def __init__(
+        self,
+        entry_id: str,
+        soft: bool = True,
+        timestamp: datetime | None = None,
+    ) -> None:
+        self.entry_id = entry_id
+        self.soft = soft
+        self.timestamp = timestamp or datetime.now()
 
 
 class UserLoggedIn(Event):

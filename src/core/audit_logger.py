@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from src.core.events import (
     ClipboardCleared,
     ClipboardCopied,
-    EntryAdded,
+    EntryCreated,
     EntryDeleted,
     EntryUpdated,
     EventBus,
@@ -23,7 +23,7 @@ class AuditLogger:
         self._subscribe()
 
     def _subscribe(self) -> None:
-        self.event_bus.subscribe(EntryAdded, self._handle_entry_added)
+        self.event_bus.subscribe(EntryCreated, self._handle_entry_created)
         self.event_bus.subscribe(EntryUpdated, self._handle_entry_updated)
         self.event_bus.subscribe(EntryDeleted, self._handle_entry_deleted)
 
@@ -36,7 +36,7 @@ class AuditLogger:
     def _write(
         self,
         action: str,
-        entry_id: int | None = None,
+        entry_id: str | None = None,
         details: str | None = None,
     ) -> None:
         timestamp = datetime.now(timezone.utc).isoformat()
@@ -54,20 +54,24 @@ class AuditLogger:
             (action, timestamp, entry_id, details),
         )
 
-    def _handle_entry_added(self, event: EntryAdded) -> None:
-        self._write("entry_added")
+    def _handle_entry_created(self, event: EntryCreated) -> None:
+        self._write("entry_created", entry_id=event.entry_id)
 
     def _handle_entry_updated(self, event: EntryUpdated) -> None:
-        self._write("entry_updated")
+        self._write("entry_updated", entry_id=event.entry_id)
 
     def _handle_entry_deleted(self, event: EntryDeleted) -> None:
-        self._write("entry_deleted")
+        self._write(
+            "entry_deleted",
+            entry_id=event.entry_id,
+            details=f"soft={event.soft}",
+        )
 
     def _handle_user_logged_in(self, event: UserLoggedIn) -> None:
         self._write("user_logged_in")
 
     def _handle_user_logged_out(self, event: UserLoggedOut) -> None:
-        self._write("user_logged_out")
+        self._write("user_logged_out", details=f"reason={event.reason}")
 
     def _handle_clipboard_copied(self, event: ClipboardCopied) -> None:
         self._write("clipboard_copied")
