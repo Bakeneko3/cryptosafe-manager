@@ -31,3 +31,6 @@ dist/
 # OS
 Thumbs.db
 .DS_Store
+
+# Password
+vault_password.txt
