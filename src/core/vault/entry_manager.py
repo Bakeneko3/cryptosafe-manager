@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from src.core.vault.encryption_service import AESGCMService
@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from src.core.key_manager import KeyManager
 
 
+SOFT_DELETE_TTL_DAYS = 30
 ENTRY_VERSION = 1
 
 
@@ -190,6 +191,143 @@ class EntryManager:
             result.append(payload)
 
         return result
+
+    # ------------------------------------------------------------------ #
+    # CRUD-1: update
+    # ------------------------------------------------------------------ #
+
+    def update_entry(self, entry_id: str, data: dict) -> dict:
+        """
+        Update an existing vault entry.
+
+        Merges `data` into the current payload, updates updated_at,
+        re-encrypts, and stores atomically. Returns the new payload.
+
+        Raises VaultValidationError on bad input, VaultOperationError
+        on any failure (including unknown ID, per SEC-4).
+        """
+        if not isinstance(data, dict):
+            raise VaultValidationError("Entry data must be a dict.")
+
+        try:
+            current = self.get_entry(entry_id)
+        except VaultOperationError:
+            raise
+
+        # Merge: only provided keys overwrite existing ones.
+        merged = {**current}
+        for key in ("title", "username", "password", "url", "notes", "category"):
+            if key in data:
+                merged[key] = str(data[key])
+
+        if "title" in data and not str(data["title"]).strip():
+            raise VaultValidationError("Title is required.")
+        if "password" in data and not data["password"]:
+            raise VaultValidationError("Password is required.")
+
+        now = datetime.now(timezone.utc).isoformat()
+        merged["updated_at"] = now
+
+        # Persist a clean payload (strip tags — it lives in its own column).
+        payload = self._build_payload(
+            {k: v for k, v in merged.items() if k != "tags"},
+            entry_id,
+            created_at=merged.get("created_at", now),
+            updated_at=now,
+        )
+
+        try:
+            blob = self._encrypt_payload(payload)
+        except RuntimeError as exc:
+            raise VaultOperationError("Vault is locked.") from exc
+
+        # Tags: update only if explicitly provided.
+        if "tags" in data:
+            raw = data["tags"] or ""
+            tags = raw if isinstance(raw, str) else ",".join(str(t) for t in raw)
+            try:
+                with self._db.transaction():
+                    self._db.execute_in_transaction(
+                        """
+                        UPDATE vault_entries
+                        SET encrypted_data = ?, updated_at = ?, tags = ?
+                        WHERE id = ?
+                        """,
+                        (blob, now, tags, entry_id),
+                    )
+            except Exception as exc:
+                raise VaultOperationError("Failed to update entry.") from exc
+        else:
+            try:
+                with self._db.transaction():
+                    self._db.execute_in_transaction(
+                        """
+                        UPDATE vault_entries
+                        SET encrypted_data = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (blob, now, entry_id),
+                    )
+            except Exception as exc:
+                raise VaultOperationError("Failed to update entry.") from exc
+
+        if self._events is not None:
+            from src.core.events import EntryUpdated
+            self._events.publish(EntryUpdated(entry_id=entry_id))
+
+        payload["tags"] = data.get("tags", merged.get("tags", ""))
+        return payload
+
+    # ------------------------------------------------------------------ #
+    # CRUD-1: delete (CRUD-4: soft delete)
+    # ------------------------------------------------------------------ #
+
+    def delete_entry(self, entry_id: str, soft_delete: bool = True) -> None:
+        """
+        Delete an entry.
+
+        With soft_delete=True (default) the row is moved to
+        deleted_entries and scheduled for expiry after SOFT_DELETE_TTL_DAYS.
+        With soft_delete=False the row is removed permanently.
+
+        Raises VaultOperationError on any failure (including unknown ID).
+        """
+        try:
+            row = self._db.fetch_one(
+                "SELECT encrypted_data, tags FROM vault_entries WHERE id = ?",
+                (entry_id,),
+            )
+        except Exception as exc:
+            raise VaultOperationError("Failed to delete entry.") from exc
+
+        if row is None:
+            raise VaultOperationError("Failed to delete entry.")
+
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        expires_iso = (now + timedelta(days=SOFT_DELETE_TTL_DAYS)).isoformat()
+
+        try:
+            with self._db.transaction():
+                if soft_delete:
+                    self._db.execute_in_transaction(
+                        """
+                        INSERT OR REPLACE INTO deleted_entries
+                            (id, encrypted_data, deleted_at, expires_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (entry_id, row["encrypted_data"], now_iso, expires_iso),
+                    )
+                self._db.execute_in_transaction(
+                    "DELETE FROM vault_entries WHERE id = ?",
+                    (entry_id,),
+                )
+        except Exception as exc:
+            raise VaultOperationError("Failed to delete entry.") from exc
+
+        if self._events is not None:
+            from src.core.events import EntryDeleted
+            self._events.publish(EntryDeleted(entry_id=entry_id, soft=soft_delete))
 
     # ------------------------------------------------------------------ #
     # Internals
