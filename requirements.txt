@@ -1,5 +1,8 @@
-cryptography
-argon2-cffi
-pyperclip
-pytest
-pytest-cov
+# Runtime
+cryptography==50.0.1
+argon2-cffi==25.1.0
+pyperclip==1.11.0
+
+# Dev / test
+pytest==9.1.1
+pytest-cov==7.1.0

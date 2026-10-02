@@ -78,6 +78,21 @@ class Database:
                 hash BLOB,
                 params TEXT
             );
+
+            CREATE INDEX IF NOT EXISTS idx_audit_log_entry_id
+                ON audit_log(entry_id);
+
+            CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp
+                ON audit_log(timestamp);
+
+            CREATE INDEX IF NOT EXISTS idx_vault_entries_title
+                ON vault_entries(title);
+
+            CREATE INDEX IF NOT EXISTS idx_vault_entries_tags
+                ON vault_entries(tags);
+
+            CREATE INDEX IF NOT EXISTS idx_key_store_key_type
+                ON key_store(key_type);
             """
         )
 
