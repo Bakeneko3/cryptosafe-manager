@@ -479,3 +479,68 @@ def test_change_password_atomic_rollback_on_failure(
     km.lock()
     assert km.unlock(STRONG).success is True
     assert km.unlock(NEW_STRONG).success is False
+
+
+# --------------------------------------------------------------------- #
+# TEST-5: full password change integration
+# --------------------------------------------------------------------- #
+
+
+def test_test5_password_change_integration(
+    tmp_path: Path, fast_kd: KeyDerivation
+) -> None:
+    """
+    TEST-5 (full):
+        1. Create vault with password A.
+        2. Add 10 entries (encrypted with A's key).
+        3. Lock, unlock with A: all entries readable.
+        4. Change password A -> B.
+        5. Lock, unlock with B: all entries readable.
+        6. Old password A no longer unlocks.
+    """
+    from src.core.crypto.placeholder import AES256Placeholder
+
+    PASSWORD_A = "Original-Strong-Pass-11!"
+    PASSWORD_B = "Rotated-Strong-Pass-22@"
+
+    db = Database(tmp_path / "test5.db")
+    try:
+        km = KeyManager(db, key_derivation=fast_kd)
+        km.create_vault(PASSWORD_A)
+
+        # Step 2: add 10 entries, encrypting each with the current key.
+        service = AES256Placeholder(km)
+        plaintexts = [f"secret-number-{i}".encode("utf-8") for i in range(10)]
+        for i, pt in enumerate(plaintexts):
+            _insert_dummy_entry(db, f"entry-{i}", service.encrypt(pt))
+
+        # Step 3: lock / unlock with A, verify all entries readable.
+        km.lock()
+        assert km.unlock(PASSWORD_A).success is True
+        service_a = AES256Placeholder(km)
+        rows = db.fetch_all(
+            "SELECT id, encrypted_password FROM vault_entries ORDER BY id"
+        )
+        assert len(rows) == 10
+        for row, expected in zip(rows, plaintexts):
+            assert service_a.decrypt(bytes(row["encrypted_password"])) == expected
+
+        # Step 4: rotate to password B.
+        km.change_password(PASSWORD_A, PASSWORD_B)
+
+        # Step 5: lock, unlock with B, verify all entries readable.
+        km.lock()
+        assert km.unlock(PASSWORD_B).success is True
+        service_b = AES256Placeholder(km)
+        rows = db.fetch_all(
+            "SELECT id, encrypted_password FROM vault_entries ORDER BY id"
+        )
+        assert len(rows) == 10
+        for row, expected in zip(rows, plaintexts):
+            assert service_b.decrypt(bytes(row["encrypted_password"])) == expected
+
+        # Step 6: old password A must no longer unlock.
+        km.lock()
+        assert km.unlock(PASSWORD_A).success is False
+    finally:
+        db.close()
