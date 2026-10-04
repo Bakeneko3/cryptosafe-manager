@@ -2,36 +2,64 @@
 Main application window.
 
 Responsible for:
-  * initializing core services (Database, EventBus, KeyManager, AuditLogger);
+  * initializing core services (Database, EventBus, KeyManager,
+    AuditLogger, EntryManager);
   * running the first-run SetupWizard or the LoginDialog at startup;
-  * hosting the main menu, vault table, and status bar;
-  * handling Lock / Change Password / Exit actions.
+  * hosting the main menu, vault table, search bar, and status bar;
+  * handling CRUD (Add/Edit/Delete), search, Lock, Change Password,
+    and Exit actions.
 
-All authentication logic lives in KeyManager. This module only wires
-UI events to service calls.
+All authentication logic lives in KeyManager. All vault persistence
+lives in EntryManager. This module only wires UI events to service calls.
 
 Startup flow:
     mainloop() begins -> after(100) -> _run_auth_gate() shows a modal
     dialog over the (already visible) main window.
-
-The main window is NOT hidden during authentication: hiding it would
-break Toplevel.grab_set() on some Tk builds.
 """
 
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 from src.core.audit_logger import AuditLogger
 from src.core.config import DATABASE_PATH
-from src.core.events import EventBus, UserLoggedIn, UserLoggedOut
+from src.core.events import (
+    EntryCreated,
+    EntryDeleted,
+    EntryUpdated,
+    EventBus,
+    UserLoggedIn,
+    UserLoggedOut,
+)
 from src.core.key_manager import KeyManager
 from src.core.settings_manager import SettingsManager
+from src.core.vault.entry_manager import EntryManager, VaultError
+from src.core.vault.search import search_entries
 from src.database.db import Database
+from src.gui.entry_dialog import EntryDialog
 from src.gui.login_dialog import LoginDialog
 from src.gui.settings_dialog import SettingsDialog
 from src.gui.setup_wizard import SetupWizard
+
+
+# --------------------------------------------------------------------- #
+# Constants
+# --------------------------------------------------------------------- #
+
+COLUMNS = ("title", "username", "url", "updated_at")
+COLUMN_HEADINGS = {
+    "title": "Title",
+    "username": "Username",
+    "url": "URL",
+    "updated_at": "Last Modified",
+}
+COLUMN_WIDTHS = {
+    "title": 220,
+    "username": 220,
+    "url": 260,
+    "updated_at": 160,
+}
 
 
 class MainWindow(tk.Tk):
@@ -39,8 +67,8 @@ class MainWindow(tk.Tk):
         super().__init__()
 
         self.title("CryptoSafe Manager")
-        self.geometry("900x600")
-        self.minsize(700, 450)
+        self.geometry("1000x650")
+        self.minsize(800, 500)
 
         # --- core services ------------------------------------------------
         self.database = Database(DATABASE_PATH)
@@ -54,18 +82,41 @@ class MainWindow(tk.Tk):
             event_bus=self.event_bus,
         )
 
+        self.entry_manager = EntryManager(
+            self.database,
+            self.key_manager,
+            event_bus=self.event_bus,
+        )
+
+        # In-memory cache of decrypted entries (list of dicts).
+        self._entries_cache: list[dict] = []
+
+        # Track username visibility (GUI-3 global toggle).
+        self._usernames_visible = False
+
         # --- UI -----------------------------------------------------------
         self._create_menu()
+        self._create_toolbar()
+        self._create_search_bar()
         self._create_main_content()
+        self._create_context_menu()
         self._create_status_bar()
 
         # --- subscriptions ------------------------------------------------
         self.event_bus.subscribe(UserLoggedIn, self._on_logged_in)
         self.event_bus.subscribe(UserLoggedOut, self._on_logged_out)
+        self.event_bus.subscribe(EntryCreated, self._on_entry_changed)
+        self.event_bus.subscribe(EntryUpdated, self._on_entry_changed)
+        self.event_bus.subscribe(EntryDeleted, self._on_entry_changed)
+
+        # --- keyboard shortcuts -------------------------------------------
+        self.bind("<Control-n>", lambda _e: self._add_entry())
+        self.bind("<Control-e>", lambda _e: self._edit_selected())
+        self.bind("<Delete>", lambda _e: self._delete_selected())
+        self.bind("<Control-Shift-P>", lambda _e: self._toggle_usernames())
+        self.bind("<Control-f>", lambda _e: self._focus_search())
 
         # --- authentication gate ------------------------------------------
-        # Run *after* the mainloop starts so that Toplevel.grab_set()
-        # on child dialogs behaves correctly.
         self.after(100, self._run_auth_gate)
 
     # ------------------------------------------------------------------ #
@@ -73,11 +124,6 @@ class MainWindow(tk.Tk):
     # ------------------------------------------------------------------ #
 
     def _run_auth_gate(self) -> None:
-        """
-        Show SetupWizard (first run) or LoginDialog (existing vault).
-
-        If the user cancels, close the application.
-        """
         if not self.key_manager.is_initialized():
             dialog = SetupWizard(self, self.key_manager)
         else:
@@ -90,12 +136,9 @@ class MainWindow(tk.Tk):
             return
 
         self._refresh_status_bar()
+        self._refresh_entries()
 
     def _relock_and_gate(self) -> None:
-        """
-        Called after Lock: show LoginDialog again.
-        If the user cancels, close the application.
-        """
         dialog = LoginDialog(self, self.key_manager)
         self.wait_window(dialog)
 
@@ -104,6 +147,7 @@ class MainWindow(tk.Tk):
             return
 
         self._refresh_status_bar()
+        self._refresh_entries()
 
     # ------------------------------------------------------------------ #
     # Shutdown
@@ -131,19 +175,23 @@ class MainWindow(tk.Tk):
         menu_bar = tk.Menu(self)
 
         file_menu = tk.Menu(menu_bar, tearoff=False)
-        file_menu.add_command(label="New", command=self._not_implemented)
+        file_menu.add_command(label="New", command=self._add_entry)
         file_menu.add_command(label="Open", command=self._not_implemented)
         file_menu.add_command(label="Backup", command=self._not_implemented)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._shutdown)
 
         edit_menu = tk.Menu(menu_bar, tearoff=False)
-        edit_menu.add_command(label="Add", command=self._not_implemented)
-        edit_menu.add_command(label="Edit", command=self._not_implemented)
-        edit_menu.add_command(label="Delete", command=self._not_implemented)
+        edit_menu.add_command(label="Add", command=self._add_entry)
+        edit_menu.add_command(label="Edit", command=self._edit_selected)
+        edit_menu.add_command(label="Delete", command=self._delete_selected)
 
         view_menu = tk.Menu(menu_bar, tearoff=False)
         view_menu.add_command(label="Logs", command=self._not_implemented)
+        view_menu.add_command(
+            label="Toggle Usernames (Ctrl+Shift+P)",
+            command=self._toggle_usernames,
+        )
         view_menu.add_command(
             label="Settings",
             command=self._open_settings,
@@ -171,53 +219,151 @@ class MainWindow(tk.Tk):
         self.config(menu=menu_bar)
 
     # ------------------------------------------------------------------ #
-    # Main content
+    # Toolbar
+    # ------------------------------------------------------------------ #
+
+    def _create_toolbar(self) -> None:
+        toolbar = ttk.Frame(self, padding=(10, 6))
+        toolbar.pack(fill=tk.X)
+
+        ttk.Button(
+            toolbar,
+            text="+ Add",
+            command=self._add_entry,
+        ).pack(side=tk.LEFT)
+
+        ttk.Button(
+            toolbar,
+            text="Edit",
+            command=self._edit_selected,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        ttk.Button(
+            toolbar,
+            text="Delete",
+            command=self._delete_selected,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(
+            side=tk.LEFT, fill=tk.Y, padx=10
+        )
+
+        ttk.Button(
+            toolbar,
+            text="Show/Hide Usernames",
+            command=self._toggle_usernames,
+        ).pack(side=tk.LEFT)
+
+        ttk.Button(
+            toolbar,
+            text="Refresh",
+            command=self._refresh_entries,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+    # ------------------------------------------------------------------ #
+    # Search bar
+    # ------------------------------------------------------------------ #
+
+    def _create_search_bar(self) -> None:
+        bar = ttk.Frame(self, padding=(10, 0))
+        bar.pack(fill=tk.X)
+
+        ttk.Label(bar, text="Search:").pack(side=tk.LEFT)
+
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self._apply_filter())
+
+        self.search_entry = ttk.Entry(bar, textvariable=self.search_var)
+        self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6))
+
+        self.fuzzy_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            bar,
+            text="Fuzzy",
+            variable=self.fuzzy_var,
+            command=self._apply_filter,
+        ).pack(side=tk.LEFT)
+
+        ttk.Button(
+            bar,
+            text="Clear",
+            command=lambda: self.search_var.set(""),
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+    # ------------------------------------------------------------------ #
+    # Main content (table)
     # ------------------------------------------------------------------ #
 
     def _create_main_content(self) -> None:
         frame = ttk.Frame(self, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ("title", "username", "url", "tags")
-
         self.table = ttk.Treeview(
             frame,
-            columns=columns,
+            columns=COLUMNS,
             show="headings",
+            selectmode="extended",
         )
 
-        self.table.heading("title", text="Title")
-        self.table.heading("username", text="Username")
-        self.table.heading("url", text="URL")
-        self.table.heading("tags", text="Tags")
+        for col in COLUMNS:
+            self.table.heading(
+                col,
+                text=COLUMN_HEADINGS[col],
+                command=lambda c=col: self._sort_by(c),
+            )
+            self.table.column(col, width=COLUMN_WIDTHS[col])
 
-        self.table.column("title", width=200)
-        self.table.column("username", width=200)
-        self.table.column("url", width=250)
-        self.table.column("tags", width=150)
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.table.yview)
+        self.table.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.table.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self.table.pack(fill=tk.BOTH, expand=True)
+        self.table.bind("<Double-1>", lambda _e: self._edit_selected())
 
-        # Placeholder data for Sprint 2 (real CRUD arrives in Sprint 3).
-        self.table.insert(
-            "",
-            tk.END,
-            values=(
-                "Example Entry",
-                "user@example.com",
-                "https://example.com",
-                "demo",
-            ),
+        # Sort state: column name -> bool (reverse)
+        self._sort_reverse = False
+        self._sort_column: str | None = None
+
+    def _create_context_menu(self) -> None:
+        self.context_menu = tk.Menu(self, tearoff=False)
+        self.context_menu.add_command(label="Edit", command=self._edit_selected)
+        self.context_menu.add_command(
+            label="Copy Password",
+            command=self._copy_password_selected,
         )
+        self.context_menu.add_command(
+            label="Copy Username",
+            command=self._copy_username_selected,
+        )
+        self.context_menu.add_separator()
+        self.context_menu.add_command(
+            label="Delete",
+            command=self._delete_selected,
+        )
+
+        self.table.bind("<Button-3>", self._show_context_menu)
+
+    def _show_context_menu(self, event) -> None:
+        row = self.table.identify_row(event.y)
+        if row:
+            self.table.selection_set(row)
+            try:
+                self.context_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.context_menu.grab_release()
+
+    # ------------------------------------------------------------------ #
+    # Status bar
+    # ------------------------------------------------------------------ #
 
     def _create_status_bar(self) -> None:
         self.status_bar = ttk.Frame(self, relief=tk.SUNKEN)
 
-        self.login_status = ttk.Label(
-            self.status_bar,
-            text="Status: Locked",
-        )
+        self.login_status = ttk.Label(self.status_bar, text="Status: Locked")
         self.login_status.pack(side=tk.LEFT, padx=10)
+
+        self.count_status = ttk.Label(self.status_bar, text="Entries: 0")
+        self.count_status.pack(side=tk.LEFT, padx=10)
 
         self.clipboard_status = ttk.Label(
             self.status_bar,
@@ -234,7 +380,221 @@ class MainWindow(tk.Tk):
             self.login_status.configure(text="Status: Locked")
 
     # ------------------------------------------------------------------ #
-    # Actions
+    # Entry loading & filtering
+    # ------------------------------------------------------------------ #
+
+    def _refresh_entries(self) -> None:
+        """Reload entries from EntryManager and redraw the table."""
+        if not self.key_manager.cache.unlocked:
+            self._entries_cache = []
+            self._render_entries([])
+            return
+
+        try:
+            self._entries_cache = self.entry_manager.get_all_entries()
+        except VaultError:
+            self._entries_cache = []
+
+        self._apply_filter()
+
+    def _apply_filter(self) -> None:
+        query = self.search_var.get() if hasattr(self, "search_var") else ""
+        fuzzy = self.fuzzy_var.get() if hasattr(self, "fuzzy_var") else False
+
+        if query:
+            filtered = search_entries(
+                self._entries_cache,
+                query,
+                fuzzy=fuzzy,
+            )
+        else:
+            filtered = list(self._entries_cache)
+
+        self._render_entries(filtered)
+
+    def _render_entries(self, entries: list[dict]) -> None:
+        # Sort
+        if self._sort_column:
+            entries = sorted(
+                entries,
+                key=lambda e: str(e.get(self._sort_column, "")).lower(),
+                reverse=self._sort_reverse,
+            )
+
+        self.table.delete(*self.table.get_children())
+
+        for entry in entries:
+            username = str(entry.get("username", ""))
+            self.table.insert(
+                "",
+                tk.END,
+                iid=entry["id"],
+                values=(
+                    entry.get("title", ""),
+                    self._format_username(username),
+                    entry.get("url", ""),
+                    entry.get("updated_at", ""),
+                ),
+            )
+
+        self.count_status.configure(text=f"Entries: {len(entries)}")
+
+    def _format_username(self, username: str) -> str:
+        """
+        GUI-1: username is masked as `user••••` unless the global
+        toggle is active.
+        """
+        if self._usernames_visible or not username:
+            return username
+        if len(username) <= 4:
+            return "•" * len(username)
+        return username[:4] + "•" * (len(username) - 4)
+
+    # ------------------------------------------------------------------ #
+    # Sorting
+    # ------------------------------------------------------------------ #
+
+    def _sort_by(self, column: str) -> None:
+        if self._sort_column == column:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_column = column
+            self._sort_reverse = False
+        self._apply_filter()
+
+    # ------------------------------------------------------------------ #
+    # Selection
+    # ------------------------------------------------------------------ #
+
+    def _selected_ids(self) -> list[str]:
+        return list(self.table.selection())
+
+    def _selected_entry(self) -> dict | None:
+        ids = self._selected_ids()
+        if not ids:
+            return None
+        for entry in self._entries_cache:
+            if entry["id"] == ids[0]:
+                return entry
+        return None
+
+    # ------------------------------------------------------------------ #
+    # CRUD actions
+    # ------------------------------------------------------------------ #
+
+    def _require_unlocked(self) -> bool:
+        if not self.key_manager.cache.unlocked:
+            messagebox.showwarning(
+                "Vault locked",
+                "Unlock the vault first.",
+                parent=self,
+            )
+            return False
+        return True
+
+    def _add_entry(self) -> None:
+        if not self._require_unlocked():
+            return
+
+        dialog = EntryDialog(self)
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return
+
+        try:
+            self.entry_manager.create_entry(dialog.result)
+        except VaultError as exc:
+            messagebox.showerror(
+                "Failed to create entry",
+                str(exc),
+                parent=self,
+            )
+            return
+
+        self._refresh_entries()
+
+    def _edit_selected(self) -> None:
+        if not self._require_unlocked():
+            return
+
+        entry = self._selected_entry()
+        if entry is None:
+            return
+
+        dialog = EntryDialog(self, entry=entry)
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return
+
+        try:
+            self.entry_manager.update_entry(entry["id"], dialog.result)
+        except VaultError as exc:
+            messagebox.showerror(
+                "Failed to update entry",
+                str(exc),
+                parent=self,
+            )
+            return
+
+        self._refresh_entries()
+
+    def _delete_selected(self) -> None:
+        if not self._require_unlocked():
+            return
+
+        ids = self._selected_ids()
+        if not ids:
+            return
+
+        count = len(ids)
+        if not messagebox.askyesno(
+            "Delete entries",
+            f"Delete {count} selected entr{'y' if count == 1 else 'ies'}?",
+            parent=self,
+        ):
+            return
+
+        for entry_id in ids:
+            try:
+                self.entry_manager.delete_entry(entry_id, soft_delete=True)
+            except VaultError:
+                continue
+
+        self._refresh_entries()
+
+    # ------------------------------------------------------------------ #
+    # Clipboard actions (Sprint 4 will add auto-clear)
+    # ------------------------------------------------------------------ #
+
+    def _copy_password_selected(self) -> None:
+        entry = self._selected_entry()
+        if entry is None:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(str(entry.get("password", "")))
+        self.clipboard_status.configure(text="Clipboard: password copied")
+
+    def _copy_username_selected(self) -> None:
+        entry = self._selected_entry()
+        if entry is None:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(str(entry.get("username", "")))
+        self.clipboard_status.configure(text="Clipboard: username copied")
+
+    # ------------------------------------------------------------------ #
+    # Toggles & focus
+    # ------------------------------------------------------------------ #
+
+    def _toggle_usernames(self) -> None:
+        self._usernames_visible = not self._usernames_visible
+        self._apply_filter()
+
+    def _focus_search(self) -> None:
+        self.search_entry.focus_set()
+
+    # ------------------------------------------------------------------ #
+    # Other actions
     # ------------------------------------------------------------------ #
 
     def _open_settings(self) -> None:
@@ -260,6 +620,8 @@ class MainWindow(tk.Tk):
 
     def _lock_vault(self) -> None:
         self.key_manager.lock(reason="manual")
+        self._entries_cache = []
+        self.table.delete(*self.table.get_children())
         self._relock_and_gate()
 
     def _not_implemented(self) -> None:
@@ -270,7 +632,7 @@ class MainWindow(tk.Tk):
             "About CryptoSafe Manager",
             "CryptoSafe Manager\n"
             "Secure local password manager\n"
-            "Sprint 2 development build",
+            "Sprint 3 development build",
         )
 
     # ------------------------------------------------------------------ #
@@ -282,6 +644,9 @@ class MainWindow(tk.Tk):
 
     def _on_logged_out(self, event: UserLoggedOut) -> None:
         self._refresh_status_bar()
+
+    def _on_entry_changed(self, event) -> None:
+        self._refresh_entries()
 
 
 if __name__ == "__main__":
