@@ -178,9 +178,13 @@ class EntryDialog(tk.Toplevel):
     # ------------------------------------------------------------------ #
 
     def _on_generate(self) -> None:
-        pw = self._generator.generate()
-        self.password_entry.set(pw)
-        self._update_strength()
+        from src.gui.password_generator_dialog import PasswordGeneratorDialog
+
+        dlg = PasswordGeneratorDialog(self)
+        self.wait_window(dlg)
+        if dlg.result:
+            self.password_entry.set(dlg.result)
+            self._update_strength()
 
     def _update_strength(self, event=None) -> None:
         pw = self.password_entry.get()
