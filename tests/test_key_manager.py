@@ -1,12 +1,10 @@
-"""Tests for src/core/key_manager.py (Sprint 2, step 7a)."""
+"""Tests for src/core/key_manager.py (Sprint 2/3)."""
 
 from pathlib import Path
 
 import pytest
-pytestmark = pytest.mark.skip(reason="Sprint 3: will be rewritten in step 5 for new vault schema")
 
 from src.core.crypto.key_derivation import KeyDerivation
-from src.core.crypto.key_storage import KeyCache
 from src.core.key_manager import (
     KEY_TYPE_AUTH_HASH,
     KEY_TYPE_ENC_SALT,
@@ -14,11 +12,8 @@ from src.core.key_manager import (
     KeyManager,
     UnlockResult,
 )
+from src.core.vault.encryption_service import AESGCMService
 from src.database.db import Database
-pytestmark = pytest.mark.skip(
-    reason="Sprint 3: key_manager tests will be rewritten in step 5 "
-           "for the new UUID + encrypted_data vault schema"
-)
 
 
 # --------------------------------------------------------------------- #
@@ -52,6 +47,7 @@ def km(db: Database, fast_kd: KeyDerivation) -> KeyManager:
 
 
 STRONG = "Correct-Horse-Battery-42!"
+NEW_STRONG = "Another-Strong-Pass-99$"
 
 
 # --------------------------------------------------------------------- #
@@ -197,7 +193,7 @@ def test_lock_hides_key(km: KeyManager) -> None:
     km.create_vault(STRONG)
     km.lock()
     assert km.get_encryption_key() is None
-    assert km.cache.has_key is True  # not wiped, just hidden
+    assert km.cache.has_key is True
     assert km.cache.unlocked is False
 
 
@@ -346,21 +342,24 @@ def test_manager_works_without_event_bus(
 # --------------------------------------------------------------------- #
 
 
-NEW_STRONG = "Another-Strong-Pass-99$"
-
-
-def _insert_dummy_entry(db: Database, title: str, ciphertext: bytes) -> int:
+def _insert_dummy_entry(db: Database, title: str, ciphertext: bytes) -> str:
+    """
+    Insert a raw entry using the Sprint 3 schema (UUID + encrypted_data).
+    `title` is unused in the new schema; kept for signature compatibility.
+    """
+    import uuid
     from datetime import datetime, timezone
+    entry_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
-    cur = db.execute(
+    db.execute(
         """
         INSERT INTO vault_entries
-            (title, username, encrypted_password, created_at, updated_at)
+            (id, encrypted_data, created_at, updated_at, tags)
         VALUES (?, ?, ?, ?, ?)
         """,
-        (title, "user", ciphertext, now, now),
+        (entry_id, ciphertext, now, now, ""),
     )
-    return cur.lastrowid
+    return entry_id
 
 
 def test_change_password_requires_unlocked(km: KeyManager) -> None:
@@ -432,29 +431,30 @@ def test_change_password_blocks_old_password(km: KeyManager) -> None:
 
 def test_change_password_re_encrypts_entries(km: KeyManager, db: Database) -> None:
     """TEST-5 (reduced): entries survive a password change."""
-    from src.core.crypto.placeholder import AES256Placeholder
-
     km.create_vault(STRONG)
 
-    # Encrypt 10 entries with the current (old) key via a temp service.
-    service = AES256Placeholder(km)
+    service = AESGCMService(km)
     plaintexts = [f"secret-{i}".encode("utf-8") for i in range(10)]
     for i, pt in enumerate(plaintexts):
         _insert_dummy_entry(db, f"entry-{i}", service.encrypt(pt))
 
     km.change_password(STRONG, NEW_STRONG)
 
-    # After the change, the cached key is the new one.
-    service_after = AES256Placeholder(km)
-    rows = db.fetch_all("SELECT id, encrypted_password FROM vault_entries ORDER BY id")
+    service_after = AESGCMService(km)
+    rows = db.fetch_all(
+        "SELECT id, encrypted_data FROM vault_entries"
+    )
     assert len(rows) == 10
-    for row, expected in zip(rows, plaintexts):
-        decrypted = service_after.decrypt(bytes(row["encrypted_password"]))
-        assert decrypted == expected
+
+    decrypted = {
+        service_after.decrypt(bytes(row["encrypted_data"]))
+        for row in rows
+    }
+    assert decrypted == set(plaintexts)
 
 
 def test_change_password_atomic_rollback_on_failure(
-    km: KeyManager, db: Database
+    db: Database, km: KeyManager
 ) -> None:
     """
     If re-encryption fails midway, the DB must roll back and the old
@@ -462,25 +462,17 @@ def test_change_password_atomic_rollback_on_failure(
     """
     km.create_vault(STRONG)
 
-    # Insert one entry that will not decrypt cleanly (garbage bytes).
-    _insert_dummy_entry(db, "garbage", b"\xff\xff\xff")
+    # Insert one valid entry.
+    service = AESGCMService(km)
+    _insert_dummy_entry(db, "entry", service.encrypt(b"data"))
 
-    with pytest.raises(Exception):
-        # XOR never fails on arbitrary bytes, so simulate failure by
-        # monkey-patching the service to raise inside re-encryption.
-        original = km._re_encrypt_all_entries
+    # Insert one bogus entry that will fail to decrypt during re-encryption.
+    _insert_dummy_entry(db, "bogus", b"\xff" * 40)
 
-        def boom(old_key, new_key):
-            original(old_key, new_key)
-            raise RuntimeError("simulated failure after first transaction")
+    with pytest.raises(RuntimeError):
+        km.change_password(STRONG, NEW_STRONG)
 
-        km._re_encrypt_all_entries = boom  # type: ignore[assignment]
-        try:
-            km.change_password(STRONG, NEW_STRONG)
-        finally:
-            km._re_encrypt_all_entries = original  # type: ignore[assignment]
-
-    # key_store must still accept the old password.
+    # Old password must still unlock.
     km.lock()
     assert km.unlock(STRONG).success is True
     assert km.unlock(NEW_STRONG).success is False
@@ -503,8 +495,6 @@ def test_test5_password_change_integration(
         5. Lock, unlock with B: all entries readable.
         6. Old password A no longer unlocks.
     """
-    from src.core.crypto.placeholder import AES256Placeholder
-
     PASSWORD_A = "Original-Strong-Pass-11!"
     PASSWORD_B = "Rotated-Strong-Pass-22@"
 
@@ -514,7 +504,7 @@ def test_test5_password_change_integration(
         km.create_vault(PASSWORD_A)
 
         # Step 2: add 10 entries, encrypting each with the current key.
-        service = AES256Placeholder(km)
+        service = AESGCMService(km)
         plaintexts = [f"secret-number-{i}".encode("utf-8") for i in range(10)]
         for i, pt in enumerate(plaintexts):
             _insert_dummy_entry(db, f"entry-{i}", service.encrypt(pt))
@@ -522,13 +512,13 @@ def test_test5_password_change_integration(
         # Step 3: lock / unlock with A, verify all entries readable.
         km.lock()
         assert km.unlock(PASSWORD_A).success is True
-        service_a = AES256Placeholder(km)
-        rows = db.fetch_all(
-            "SELECT id, encrypted_password FROM vault_entries ORDER BY id"
-        )
+        service_a = AESGCMService(km)
+        rows = db.fetch_all("SELECT encrypted_data FROM vault_entries")
         assert len(rows) == 10
-        for row, expected in zip(rows, plaintexts):
-            assert service_a.decrypt(bytes(row["encrypted_password"])) == expected
+        decrypted_a = {
+            service_a.decrypt(bytes(row["encrypted_data"])) for row in rows
+        }
+        assert decrypted_a == set(plaintexts)
 
         # Step 4: rotate to password B.
         km.change_password(PASSWORD_A, PASSWORD_B)
@@ -536,13 +526,13 @@ def test_test5_password_change_integration(
         # Step 5: lock, unlock with B, verify all entries readable.
         km.lock()
         assert km.unlock(PASSWORD_B).success is True
-        service_b = AES256Placeholder(km)
-        rows = db.fetch_all(
-            "SELECT id, encrypted_password FROM vault_entries ORDER BY id"
-        )
+        service_b = AESGCMService(km)
+        rows = db.fetch_all("SELECT encrypted_data FROM vault_entries")
         assert len(rows) == 10
-        for row, expected in zip(rows, plaintexts):
-            assert service_b.decrypt(bytes(row["encrypted_password"])) == expected
+        decrypted_b = {
+            service_b.decrypt(bytes(row["encrypted_data"])) for row in rows
+        }
+        assert decrypted_b == set(plaintexts)
 
         # Step 6: old password A must no longer unlock.
         km.lock()

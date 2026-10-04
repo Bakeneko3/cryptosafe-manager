@@ -8,7 +8,6 @@ Wires together:
   * BackoffPolicy   -- exponential backoff on failed logins
   * Database        -- key_store persistence
   * EventBus        -- optional: publishes UserLoggedIn / UserLoggedOut
-  * EncryptionService -- used for re-encrypting the vault on password change
 
 Public API:
     * is_initialized()                -- has a vault been created?
@@ -27,8 +26,12 @@ KeyCache and is never written to disk (SEC-1, SEC-2).
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from src.core import config
 from src.core.crypto.authentication import (
@@ -42,8 +45,10 @@ from src.core.events import UserLoggedIn, UserLoggedOut
 from src.database.db import Database
 
 if TYPE_CHECKING:
-    from src.core.crypto.abstract import EncryptionService
     from src.core.events import EventBus
+
+
+NONCE_SIZE = 12
 
 
 # --------------------------------------------------------------------- #
@@ -79,7 +84,6 @@ class KeyManager:
         database: Database,
         *,
         event_bus: "EventBus | None" = None,
-        encryption_service_factory: "Callable[[KeyManager], EncryptionService] | None" = None,
         key_derivation: KeyDerivation | None = None,
         key_cache: KeyCache | None = None,
         validator: PasswordStrengthValidator | None = None,
@@ -87,7 +91,6 @@ class KeyManager:
     ) -> None:
         self._db = database
         self._events = event_bus
-        self._encryption_service_factory = encryption_service_factory
         self._kd = key_derivation or KeyDerivation()
         self._cache = key_cache or KeyCache()
         self._validator = validator or PasswordStrengthValidator()
@@ -254,21 +257,22 @@ class KeyManager:
         new_salt = self._kd.generate_salt(config.PBKDF2_SALT_LEN)
         new_key = self._kd.derive_encryption_key(new_password, new_salt)
 
-        self._re_encrypt_all_entries(old_key, new_key)
-
-        with self._db.transaction():
-            self._db.execute_in_transaction(
-                "UPDATE key_store SET key_data = ?, version = ? WHERE key_type = ?",
-                (new_hash.encode("utf-8"), config.KEY_STORE_VERSION, KEY_TYPE_AUTH_HASH),
-            )
-            self._db.execute_in_transaction(
-                "UPDATE key_store SET key_data = ?, version = ? WHERE key_type = ?",
-                (new_salt, config.KEY_STORE_VERSION, KEY_TYPE_ENC_SALT),
-            )
+        try:
+            self._re_encrypt_all_entries(old_key, new_key)
+            with self._db.transaction():
+                self._db.execute_in_transaction(
+                    "UPDATE key_store SET key_data = ?, version = ? WHERE key_type = ?",
+                    (new_hash.encode("utf-8"), config.KEY_STORE_VERSION, KEY_TYPE_AUTH_HASH),
+                )
+                self._db.execute_in_transaction(
+                    "UPDATE key_store SET key_data = ?, version = ? WHERE key_type = ?",
+                    (new_salt, config.KEY_STORE_VERSION, KEY_TYPE_ENC_SALT),
+                )
+        finally:
+            old_key = b"\x00" * len(old_key)  # noqa: F841
 
         self._cache.store(new_key)
         new_key = b"\x00" * len(new_key)  # noqa: F841
-        old_key = b"\x00" * len(old_key)  # noqa: F841
 
         self._session.record_login()
         if self._events is not None:
@@ -278,35 +282,42 @@ class KeyManager:
         """
         Decrypt every vault entry with old_key and re-encrypt with new_key.
 
-        Runs in a single transaction. The EncryptionService currently in
-        use is the Sprint 2 placeholder (XOR); the real AES-256-GCM
-        implementation lands in Sprint 3 and will not change this call
-        site.
+        Runs in a single transaction; on any failure the transaction
+        rolls back, leaving the vault unchanged (CHANGE-4).
         """
-        from src.core.crypto.placeholder import AES256Placeholder
-
-        # Build a temporary service bound to a fake manager that yields
-        # the desired key. This keeps the change_password logic independent
-        # of how EncryptionService obtains its key.
-        #
-        # Implementation note: we do not reuse self._cache because we need
-        # to decrypt with the OLD key while the new key is already prepared.
-        old_svc = _StaticKeyService(AES256Placeholder, old_key)
-        new_svc = _StaticKeyService(AES256Placeholder, new_key)
+        old_aesgcm = AESGCM(bytes(old_key))
+        new_aesgcm = AESGCM(bytes(new_key))
 
         rows = self._db.fetch_all(
-            "SELECT id, encrypted_password FROM vault_entries"
+            "SELECT id, encrypted_data FROM vault_entries"
         )
 
         with self._db.transaction():
             for row in rows:
                 entry_id = row["id"]
-                blob = bytes(row["encrypted_password"])
-                plaintext = old_svc.decrypt(blob)
-                re_encrypted = new_svc.encrypt(plaintext)
+                blob = bytes(row["encrypted_data"])
+
+                # Split envelope.
+                nonce = blob[:NONCE_SIZE]
+                ct_and_tag = blob[NONCE_SIZE:]
+
+                # Decrypt with old key.
+                try:
+                    plaintext = old_aesgcm.decrypt(nonce, ct_and_tag, None)
+                except InvalidTag as exc:
+                    raise RuntimeError(
+                        f"Failed to re-encrypt entry {entry_id}: "
+                        f"authentication failed."
+                    ) from exc
+
+                # Encrypt with new key, fresh nonce.
+                new_nonce = os.urandom(NONCE_SIZE)
+                new_ct_and_tag = new_aesgcm.encrypt(new_nonce, plaintext, None)
+                new_blob = new_nonce + new_ct_and_tag
+
                 self._db.execute_in_transaction(
-                    "UPDATE vault_entries SET encrypted_password = ? WHERE id = ?",
-                    (re_encrypted, entry_id),
+                    "UPDATE vault_entries SET encrypted_data = ? WHERE id = ?",
+                    (new_blob, entry_id),
                 )
 
     # ------------------------------------------------------------------ #
@@ -341,38 +352,3 @@ class KeyManager:
             return json.loads(row["key_data"].decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return None
-
-
-# --------------------------------------------------------------------- #
-# Helper: a throwaway EncryptionService bound to a fixed key
-# --------------------------------------------------------------------- #
-
-
-class _StaticKeyService:
-    """
-    Wraps an EncryptionService class to make it use a fixed key instead
-    of pulling it from a live KeyManager.
-
-    Used only internally by KeyManager.change_password, where we must
-    hold two keys at once (old and new).
-    """
-
-    def __init__(self, service_cls, key: bytes) -> None:
-        manager = _StaticKeyManager(key)
-        self._svc = service_cls(manager)
-
-    def encrypt(self, data: bytes) -> bytes:
-        return self._svc.encrypt(data)
-
-    def decrypt(self, data: bytes) -> bytes:
-        return self._svc.decrypt(data)
-
-
-class _StaticKeyManager:
-    """Minimal KeyManager-shaped object returning a fixed key."""
-
-    def __init__(self, key: bytes) -> None:
-        self._key = bytearray(key)
-
-    def get_encryption_key(self) -> bytearray:
-        return self._key
