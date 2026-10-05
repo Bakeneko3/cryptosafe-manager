@@ -4,7 +4,7 @@ CryptoSafe Manager is a cross-platform desktop password manager developed as an 
 
 The application is designed to securely store password entries in a local database, provide a graphical user interface, protect sensitive data with modern cryptographic primitives, and maintain an auditable history of security-related actions.
 
-> **Current status:** Sprint 3 — Vault CRUD + AES-256-GCM
+> **Current status:** Sprint 4 — Secure Clipboard
 
 ## Project Vision
 
@@ -37,8 +37,8 @@ The project follows an MVC-like separation of responsibilities:
 ┌─────────────────────────────┐
 │          Core Layer         │
 │       src/core/             │
-│ Crypto / Vault / Events /   │
-│ Settings / Key Management   │
+│ Crypto / Vault / Clipboard /│
+│ Events / Settings / Keys    │
 └──────────────┬──────────────┘
                │
                ▼
@@ -69,6 +69,11 @@ cryptosafe-manager/
 │   │   │   ├── entry_manager.py
 │   │   │   ├── password_generator.py
 │   │   │   └── search.py
+│   │   ├── clipboard/
+│   │   │   ├── clipboard_service.py
+│   │   │   ├── clipboard_monitor.py
+│   │   │   ├── clipboard_settings.py
+│   │   │   └── platform_adapter.py
 │   │   ├── audit_logger.py
 │   │   ├── config.py
 │   │   ├── events.py
@@ -83,6 +88,7 @@ cryptosafe-manager/
 │   └── gui/
 │       ├── widgets/
 │       ├── change_password_dialog.py
+│       ├── clipboard_settings_dialog.py
 │       ├── entry_dialog.py
 │       ├── login_dialog.py
 │       ├── main_window.py
@@ -117,9 +123,9 @@ The schema (version 3) contains:
 
 Database schema versioning is implemented using SQLite `PRAGMA user_version`. Migrations run automatically on startup.
 
-## Security Model (Sprint 3)
+## Security Model
 
-Master password handling:
+### Master password
 
 * The master password itself is **never stored**.
 * An Argon2id hash of the password is stored in `key_store` for verification.
@@ -130,7 +136,7 @@ Master password handling:
 * Failed login attempts trigger exponential backoff (1s / 5s / 30s).
 * Password change re-encrypts all vault entries atomically.
 
-Per-entry encryption:
+### Per-entry encryption
 
 * Every vault entry is serialized to JSON and encrypted individually
   with **AES-256-GCM** (`cryptography.hazmat.primitives.ciphers.aead.AESGCM`).
@@ -138,6 +144,26 @@ Per-entry encryption:
 * The stored blob has the format `nonce (12 B) || ciphertext || tag (16 B)`.
 * The authentication tag is verified on decryption; tampering is detected
   and rejected.
+
+### Clipboard (Sprint 4)
+
+* All clipboard content is written **plaintext** to the system clipboard:
+  obfuscation is not possible because other applications must be able to
+  paste the value.
+* Protection relies on **auto-clear** and explicit user actions.
+* Auto-clear is **configurable** (5 s – 5 min, default 30 s, or never).
+* The clipboard is cleared when:
+  * the timer expires;
+  * the user selects "Clear Clipboard";
+  * the vault is locked (manual or automatic);
+  * the application closes;
+  * new content replaces old content.
+* A background monitor detects **content changes** made outside the
+  application and drops ownership accordingly. Detecting that another
+  process *read* the clipboard is not technically possible and is
+  deliberately out of scope.
+* The clipboard requires the vault to be unlocked; copy operations are
+  blocked on a locked vault.
 
 Argon2id parameters (configurable in `src/core/config.py`):
 
@@ -165,6 +191,24 @@ PBKDF2 parameters:
   `tag:important`) and optional fuzzy matching for typo tolerance.
 * **Table:** multi-select, sortable columns, context menu, global
   username toggle (`Ctrl+Shift+P`).
+
+## Clipboard Features
+
+* **Copy Password / Username / All** from the toolbar, menu, or context
+  menu.
+* **Auto-clear** with a live countdown in the status bar.
+* **Warning** shown a few seconds before the automatic clear.
+* **Clear Clipboard** action available in the toolbar, menu, and context
+  menu (`Ctrl+Shift+C`).
+* **Preset profiles** for quick configuration:
+  * *Standard* — 30 s timeout, basic security.
+  * *Secure* — 15 s timeout, advanced security.
+  * *Public Computer* — 5 s timeout, paranoid mode.
+* **Platform adapters**:
+  * Windows: `win32clipboard` (native `EmptyClipboard`).
+  * Fallback: `pyperclip` for other platforms.
+* **Monitor:** detects external content changes and drops ownership;
+  degrades gracefully if the clipboard cannot be read.
 
 ## Setup
 
@@ -211,6 +255,7 @@ On first run, a setup wizard will ask for a master password. On subsequent runs,
 * `Delete` — delete the selected entries
 * `Ctrl+F` — focus the search bar
 * `Ctrl+Shift+P` — toggle username visibility
+* `Ctrl+Shift+C` — clear the clipboard
 
 ## Run Tests
 
@@ -221,7 +266,7 @@ python -m pytest -v
 ```
 
 The current test suite covers crypto, key management, vault CRUD,
-search, password generation, and GUI smoke tests.
+search, password generation, clipboard behaviour, and GUI smoke tests.
 
 ## Sprint Roadmap
 
@@ -268,13 +313,22 @@ search, password generation, and GUI smoke tests.
 * main window integration (toolbar, context menu, sorting, status bar);
 * database schema v3 migration.
 
-### Sprint 4 — Secure Clipboard
+### Sprint 4 — Secure Clipboard (done)
 
-* secure clipboard service;
-* automatic clipboard clearing;
-* configurable timeout;
-* clipboard state management;
-* clipboard-related events.
+* clipboard service with auto-clear timer;
+* configurable timeout (5 s – 5 min, default 30 s, or never);
+* persistent settings stored in the `settings` table;
+* clipboard settings dialog with presets
+  (*Standard*, *Secure*, *Public Computer*);
+* platform adapters for Windows (`win32clipboard`) and generic
+  (`pyperclip`);
+* background monitor detecting external clipboard changes;
+* integration with the event bus (`ClipboardCopied`, `ClipboardCleared`);
+* audit logging of every clipboard operation;
+* toolbar, menu, and context-menu actions for copy / clear;
+* live countdown in the status bar;
+* clipboard cleared on lock and on application close;
+* integration tests for timing, concurrency, recovery, and performance.
 
 ### Sprint 5 — Audit Logs + Integrity
 
@@ -318,41 +372,44 @@ search, password generation, and GUI smoke tests.
 
 Cryptographic functionality is introduced progressively.
 
-Sprint 1 introduced intentionally insecure placeholders where required by the architecture. Sprint 2 introduced the real master-password and key derivation layer. Sprint 3 replaced the placeholder entry encryption with real AES-256-GCM.
+Sprint 1 introduced intentionally insecure placeholders where required by the architecture. Sprint 2 introduced the real master-password and key derivation layer. Sprint 3 replaced the placeholder entry encryption with real AES-256-GCM. Sprint 4 added secure clipboard handling with auto-clear and monitoring.
 
 The final application uses established cryptographic primitives from maintained libraries rather than custom cryptographic algorithms.
 
 ## Development Status
 
-| Component              | Sprint 1    | Sprint 2          | Sprint 3          |
-| ---------------------- | ----------- | ----------------- | ----------------- |
-| SQLite database        | Implemented | Implemented       | Implemented       |
-| Schema versioning      | Implemented | Implemented       | Implemented       |
-| Migration system       | Basic       | Implemented       | Implemented       |
-| GUI shell              | Implemented | Implemented       | Implemented       |
-| Settings               | Implemented | Implemented       | Implemented       |
-| Event bus              | Implemented | Implemented       | Implemented       |
-| Audit logger           | Implemented | Implemented       | Implemented       |
-| Key manager            | Stub        | Implemented       | Implemented       |
-| Backup/restore         | Stub        | Stub              | Stub              |
-| Master password        | Planned     | Implemented       | Implemented       |
-| Argon2id hashing       | Planned     | Implemented       | Implemented       |
-| PBKDF2 key derivation  | Planned     | Implemented       | Implemented       |
-| Key caching            | Planned     | Implemented       | Implemented       |
-| Failed-login backoff   | Planned     | Implemented       | Implemented       |
-| Password change        | Planned     | Implemented       | Implemented       |
-| AES-256-GCM            | Planned     | Planned (S3)      | Implemented       |
-| Vault CRUD             | Planned     | Planned (S3)      | Implemented       |
-| Password generator     | Planned     | Planned (S3)      | Implemented       |
-| Search / filter        | Planned     | Planned (S3)      | Implemented       |
-| Soft delete            | Planned     | Planned (S3)      | Implemented       |
-| Secure clipboard       | Planned     | Planned (S4)      | Planned (Sprint 4)|
-| Signed audit logs      | Planned     | Planned (S5)      | Planned (Sprint 5)|
-| Import/export          | Planned     | Planned (S6)      | Planned (Sprint 6)|
-| Auto-lock              | Planned     | Planned (S7)      | Planned (Sprint 7)|
-| OS keychain            | Planned     | Planned (S7)      | Planned (Sprint 7)|
-| Packaging              | Planned     | Planned (S8)      | Planned (Sprint 8)|
+| Component              | Sprint 1    | Sprint 2          | Sprint 3          | Sprint 4          |
+| ---------------------- | ----------- | ----------------- | ----------------- | ----------------- |
+| SQLite database        | Implemented | Implemented       | Implemented       | Implemented       |
+| Schema versioning      | Implemented | Implemented       | Implemented       | Implemented       |
+| Migration system       | Basic       | Implemented       | Implemented       | Implemented       |
+| GUI shell              | Implemented | Implemented       | Implemented       | Implemented       |
+| Settings               | Implemented | Implemented       | Implemented       | Implemented       |
+| Event bus              | Implemented | Implemented       | Implemented       | Implemented       |
+| Audit logger           | Implemented | Implemented       | Implemented       | Implemented       |
+| Key manager            | Stub        | Implemented       | Implemented       | Implemented       |
+| Backup/restore         | Stub        | Stub              | Stub              | Stub              |
+| Master password        | Planned     | Implemented       | Implemented       | Implemented       |
+| Argon2id hashing       | Planned     | Implemented       | Implemented       | Implemented       |
+| PBKDF2 key derivation  | Planned     | Implemented       | Implemented       | Implemented       |
+| Key caching            | Planned     | Implemented       | Implemented       | Implemented       |
+| Failed-login backoff   | Planned     | Implemented       | Implemented       | Implemented       |
+| Password change        | Planned     | Implemented       | Implemented       | Implemented       |
+| AES-256-GCM            | Planned     | Planned (S3)      | Implemented       | Implemented       |
+| Vault CRUD             | Planned     | Planned (S3)      | Implemented       | Implemented       |
+| Password generator     | Planned     | Planned (S3)      | Implemented       | Implemented       |
+| Search / filter        | Planned     | Planned (S3)      | Implemented       | Implemented       |
+| Soft delete            | Planned     | Planned (S3)      | Implemented       | Implemented       |
+| Secure clipboard       | Planned     | Planned (S4)      | Planned (S4)      | Implemented       |
+| Clipboard auto-clear   | Planned     | Planned (S4)      | Planned (S4)      | Implemented       |
+| Clipboard settings     | Planned     | Planned (S4)      | Planned (S4)      | Implemented       |
+| Clipboard monitor      | Planned     | Planned (S4)      | Planned (S4)      | Implemented       |
+| Signed audit logs      | Planned     | Planned (S5)      | Planned (S5)      | Planned (Sprint 5)|
+| Import/export          | Planned     | Planned (S6)      | Planned (S6)      | Planned (Sprint 6)|
+| Auto-lock              | Planned     | Planned (S7)      | Planned (S7)      | Planned (Sprint 7)|
+| OS keychain            | Planned     | Planned (S7)      | Planned (S7)      | Planned (Sprint 7)|
+| Packaging              | Planned     | Planned (S8)      | Planned (S8)      | Planned (Sprint 8)|
 
 ## License
 
-This project is developed as an academic applied cryptography project.
+This project is developed as an applied cryptography project.
