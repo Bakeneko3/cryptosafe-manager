@@ -3,26 +3,29 @@ Main application window.
 
 Responsible for:
   * initializing core services (Database, EventBus, KeyManager,
-    AuditLogger, EntryManager);
+    AuditLogger, EntryManager, ClipboardService);
   * running the first-run SetupWizard or the LoginDialog at startup;
   * hosting the main menu, vault table, search bar, and status bar;
-  * handling CRUD (Add/Edit/Delete), search, Lock, Change Password,
-    and Exit actions.
+  * handling CRUD (Add/Edit/Delete), search, clipboard operations,
+    Lock, Change Password, and Exit actions.
 
 All authentication logic lives in KeyManager. All vault persistence
-lives in EntryManager. This module only wires UI events to service calls.
-
-Startup flow:
-    mainloop() begins -> after(100) -> _run_auth_gate() shows a modal
-    dialog over the (already visible) main window.
+lives in EntryManager. All clipboard operations go through
+ClipboardService. This module only wires UI events to service calls.
 """
 
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import messagebox, ttk
 
+from src.core import config
 from src.core.audit_logger import AuditLogger
+from src.core.clipboard.clipboard_service import ClipboardService
+from src.core.clipboard.clipboard_settings import (
+    load_clipboard_settings,
+    save_clipboard_settings,
+)
 from src.core.config import DATABASE_PATH
 from src.core.events import (
     EntryCreated,
@@ -37,6 +40,7 @@ from src.core.settings_manager import SettingsManager
 from src.core.vault.entry_manager import EntryManager, VaultError
 from src.core.vault.search import search_entries
 from src.database.db import Database
+from src.gui.clipboard_settings_dialog import ClipboardSettingsDialog
 from src.gui.entry_dialog import EntryDialog
 from src.gui.login_dialog import LoginDialog
 from src.gui.settings_dialog import SettingsDialog
@@ -60,6 +64,7 @@ COLUMN_WIDTHS = {
     "url": 260,
     "updated_at": 160,
 }
+STATUS_REFRESH_MS = 1000  # update clipboard countdown every 1s
 
 
 class MainWindow(tk.Tk):
@@ -86,6 +91,14 @@ class MainWindow(tk.Tk):
             self.database,
             self.key_manager,
             event_bus=self.event_bus,
+        )
+
+        # Clipboard: load persisted settings and construct the service.
+        self._clipboard_settings = load_clipboard_settings(self.settings_manager)
+        self.clipboard_service = ClipboardService(
+            self.event_bus,
+            timeout=self._clipboard_settings.timeout,
+            on_warning=self._on_clipboard_warning,
         )
 
         # In-memory cache of decrypted entries (list of dicts).
@@ -115,6 +128,10 @@ class MainWindow(tk.Tk):
         self.bind("<Delete>", lambda _e: self._delete_selected())
         self.bind("<Control-Shift-P>", lambda _e: self._toggle_usernames())
         self.bind("<Control-f>", lambda _e: self._focus_search())
+        self.bind("<Control-Shift-C>", lambda _e: self._clear_clipboard())
+
+        # --- clipboard status refresh loop --------------------------------
+        self._schedule_clipboard_status_refresh()
 
         # --- authentication gate ------------------------------------------
         self.after(100, self._run_auth_gate)
@@ -155,6 +172,14 @@ class MainWindow(tk.Tk):
 
     def _shutdown(self) -> None:
         try:
+            self.clipboard_service.clear_if_owned(reason="shutdown")
+        except Exception:
+            pass
+        try:
+            self.clipboard_service.shutdown()
+        except Exception:
+            pass
+        try:
             self.key_manager.lock(reason="shutdown")
         except Exception:
             pass
@@ -185,6 +210,19 @@ class MainWindow(tk.Tk):
         edit_menu.add_command(label="Add", command=self._add_entry)
         edit_menu.add_command(label="Edit", command=self._edit_selected)
         edit_menu.add_command(label="Delete", command=self._delete_selected)
+        edit_menu.add_separator()
+        edit_menu.add_command(
+            label="Copy Password",
+            command=self._copy_password_selected,
+        )
+        edit_menu.add_command(
+            label="Copy Username",
+            command=self._copy_username_selected,
+        )
+        edit_menu.add_command(
+            label="Clear Clipboard",
+            command=self._clear_clipboard,
+        )
 
         view_menu = tk.Menu(menu_bar, tearoff=False)
         view_menu.add_command(label="Logs", command=self._not_implemented)
@@ -201,6 +239,15 @@ class MainWindow(tk.Tk):
         security_menu.add_command(
             label="Change Password",
             command=self._open_change_password,
+        )
+        security_menu.add_command(
+            label="Clipboard Settings",
+            command=self._open_clipboard_settings,
+        )
+        security_menu.add_separator()
+        security_menu.add_command(
+            label="Clear Clipboard",
+            command=self._clear_clipboard,
         )
         security_menu.add_command(
             label="Lock",
@@ -242,6 +289,22 @@ class MainWindow(tk.Tk):
             toolbar,
             text="Delete",
             command=self._delete_selected,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(
+            side=tk.LEFT, fill=tk.Y, padx=10
+        )
+
+        ttk.Button(
+            toolbar,
+            text="Copy Password",
+            command=self._copy_password_selected,
+        ).pack(side=tk.LEFT)
+
+        ttk.Button(
+            toolbar,
+            text="Clear Clipboard",
+            command=self._clear_clipboard,
         ).pack(side=tk.LEFT, padx=(6, 0))
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(
@@ -320,7 +383,6 @@ class MainWindow(tk.Tk):
 
         self.table.bind("<Double-1>", lambda _e: self._edit_selected())
 
-        # Sort state: column name -> bool (reverse)
         self._sort_reverse = False
         self._sort_column: str | None = None
 
@@ -334,6 +396,15 @@ class MainWindow(tk.Tk):
         self.context_menu.add_command(
             label="Copy Username",
             command=self._copy_username_selected,
+        )
+        self.context_menu.add_command(
+            label="Copy All",
+            command=self._copy_all_selected,
+        )
+        self.context_menu.add_separator()
+        self.context_menu.add_command(
+            label="Clear Clipboard",
+            command=self._clear_clipboard,
         )
         self.context_menu.add_separator()
         self.context_menu.add_command(
@@ -379,12 +450,38 @@ class MainWindow(tk.Tk):
         else:
             self.login_status.configure(text="Status: Locked")
 
+    def _schedule_clipboard_status_refresh(self) -> None:
+        try:
+            self._update_clipboard_status()
+        finally:
+            self.after(STATUS_REFRESH_MS, self._schedule_clipboard_status_refresh)
+
+    def _update_clipboard_status(self) -> None:
+        try:
+            status = self.clipboard_service.status()
+        except Exception:
+            return
+
+        if not status.active:
+            self.clipboard_status.configure(text="Clipboard: --")
+            return
+
+        if status.timeout_seconds == config.CLIPBOARD_TIMEOUT_NEVER:
+            self.clipboard_status.configure(
+                text=f"Clipboard: {status.data_type} (no auto-clear)"
+            )
+            return
+
+        remaining = int(status.remaining_seconds)
+        self.clipboard_status.configure(
+            text=f"Clipboard: {status.data_type} ({remaining}s)"
+        )
+
     # ------------------------------------------------------------------ #
     # Entry loading & filtering
     # ------------------------------------------------------------------ #
 
     def _refresh_entries(self) -> None:
-        """Reload entries from EntryManager and redraw the table."""
         if not self.key_manager.cache.unlocked:
             self._entries_cache = []
             self._render_entries([])
@@ -413,7 +510,6 @@ class MainWindow(tk.Tk):
         self._render_entries(filtered)
 
     def _render_entries(self, entries: list[dict]) -> None:
-        # Sort
         if self._sort_column:
             entries = sorted(
                 entries,
@@ -440,10 +536,6 @@ class MainWindow(tk.Tk):
         self.count_status.configure(text=f"Entries: {len(entries)}")
 
     def _format_username(self, username: str) -> str:
-        """
-        GUI-1: username is masked as `user••••` unless the global
-        toggle is active.
-        """
         if self._usernames_visible or not username:
             return username
         if len(username) <= 4:
@@ -563,24 +655,86 @@ class MainWindow(tk.Tk):
         self._refresh_entries()
 
     # ------------------------------------------------------------------ #
-    # Clipboard actions (Sprint 4 will add auto-clear)
+    # Clipboard actions (Sprint 4)
     # ------------------------------------------------------------------ #
 
     def _copy_password_selected(self) -> None:
+        if not self._require_unlocked():
+            return
         entry = self._selected_entry()
         if entry is None:
             return
-        self.clipboard_clear()
-        self.clipboard_append(str(entry.get("password", "")))
-        self.clipboard_status.configure(text="Clipboard: password copied")
+        self._copy_value(
+            str(entry.get("password", "")),
+            data_type="password",
+            entry_id=entry["id"],
+        )
 
     def _copy_username_selected(self) -> None:
+        if not self._require_unlocked():
+            return
         entry = self._selected_entry()
         if entry is None:
             return
-        self.clipboard_clear()
-        self.clipboard_append(str(entry.get("username", "")))
-        self.clipboard_status.configure(text="Clipboard: username copied")
+        self._copy_value(
+            str(entry.get("username", "")),
+            data_type="username",
+            entry_id=entry["id"],
+        )
+
+    def _copy_all_selected(self) -> None:
+        if not self._require_unlocked():
+            return
+        entry = self._selected_entry()
+        if entry is None:
+            return
+        combined = (
+            f"Title: {entry.get('title', '')}\n"
+            f"Username: {entry.get('username', '')}\n"
+            f"Password: {entry.get('password', '')}\n"
+            f"URL: {entry.get('url', '')}\n"
+            f"Notes: {entry.get('notes', '')}"
+        )
+        self._copy_value(
+            combined,
+            data_type="entry",
+            entry_id=entry["id"],
+        )
+
+    def _copy_value(
+        self,
+        value: str,
+        *,
+        data_type: str,
+        entry_id: str | None,
+    ) -> None:
+        if not value:
+            return
+        ok = self.clipboard_service.copy(
+            value,
+            data_type=data_type,
+            source_entry_id=entry_id,
+        )
+        if not ok:
+            messagebox.showwarning(
+                "Copy failed",
+                "Could not write to the system clipboard. "
+                "Another application may be holding it.",
+                parent=self,
+            )
+
+    def _clear_clipboard(self) -> None:
+        self.clipboard_service.clear(reason="manual")
+
+    def _on_clipboard_warning(self, seconds: float) -> None:
+        # Called by ClipboardService before auto-clear.
+        # We use a lightweight status message instead of a modal dialog.
+        try:
+            self.clipboard_status.configure(
+                text=f"Clipboard: clearing in {int(seconds)}s"
+            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Toggles & focus
@@ -604,6 +758,15 @@ class MainWindow(tk.Tk):
         )
         self.wait_window(dialog)
 
+    def _open_clipboard_settings(self) -> None:
+        dialog = ClipboardSettingsDialog(self, self.settings_manager)
+        self.wait_window(dialog)
+
+        if dialog.result is not None:
+            # Apply new timeout to the running service.
+            self.clipboard_service.set_timeout(dialog.result.timeout)
+            self._clipboard_settings = dialog.result
+
     def _open_change_password(self) -> None:
         try:
             from src.gui.change_password_dialog import ChangePasswordDialog
@@ -619,6 +782,9 @@ class MainWindow(tk.Tk):
         self.wait_window(dialog)
 
     def _lock_vault(self) -> None:
+        # SEC-3: clear the clipboard immediately on lock.
+        self.clipboard_service.clear_if_owned(reason="lock")
+
         self.key_manager.lock(reason="manual")
         self._entries_cache = []
         self.table.delete(*self.table.get_children())
@@ -632,7 +798,7 @@ class MainWindow(tk.Tk):
             "About CryptoSafe Manager",
             "CryptoSafe Manager\n"
             "Secure local password manager\n"
-            "Sprint 3 development build",
+            "Sprint 4 development build",
         )
 
     # ------------------------------------------------------------------ #
