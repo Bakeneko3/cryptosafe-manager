@@ -223,3 +223,70 @@ def test_needs_rehash_returns_bool(kd: KeyDerivation) -> None:
     h = kd.create_auth_hash("password-123")
     assert isinstance(kd.needs_rehash(h), bool)
     assert kd.needs_rehash("") is True
+
+
+# --------------------------------------------------------------------- #
+# HKDF subkey derivation (CRY-2)
+# --------------------------------------------------------------------- #
+
+
+def test_derive_subkey_returns_requested_length(kd: KeyDerivation) -> None:
+    master = b"\x01" * 32
+    key = kd.derive_subkey(master, b"context", length=32)
+    assert isinstance(key, bytes)
+    assert len(key) == 32
+
+
+def test_derive_subkey_different_contexts_differ(kd: KeyDerivation) -> None:
+    master = b"\x02" * 32
+    a = kd.derive_subkey(master, b"ctx-a")
+    b = kd.derive_subkey(master, b"ctx-b")
+    assert a != b
+
+
+def test_derive_subkey_is_deterministic(kd: KeyDerivation) -> None:
+    master = b"\x03" * 32
+    first = kd.derive_subkey(master, b"stable")
+    for _ in range(20):
+        assert kd.derive_subkey(master, b"stable") == first
+
+
+def test_derive_subkey_different_master_differs(kd: KeyDerivation) -> None:
+    ctx = b"same"
+    a = kd.derive_subkey(b"\x01" * 32, ctx)
+    b = kd.derive_subkey(b"\x02" * 32, ctx)
+    assert a != b
+
+
+def test_derive_subkey_rejects_empty_master(kd: KeyDerivation) -> None:
+    with pytest.raises(ValueError):
+        kd.derive_subkey(b"", b"ctx")
+
+
+def test_derive_subkey_rejects_empty_context(kd: KeyDerivation) -> None:
+    with pytest.raises(ValueError):
+        kd.derive_subkey(b"\x01" * 32, b"")
+
+
+def test_derive_subkey_rejects_short_length(kd: KeyDerivation) -> None:
+    with pytest.raises(InvalidParameterError):
+        kd.derive_subkey(b"\x01" * 32, b"ctx", length=8)
+
+
+def test_derive_signing_key_length(kd: KeyDerivation) -> None:
+    master = b"\x04" * 32
+    seed = kd.derive_signing_key(master)
+    assert len(seed) == 32
+
+
+def test_derive_signing_key_differs_from_log_key(kd: KeyDerivation) -> None:
+    master = b"\x05" * 32
+    signing = kd.derive_signing_key(master)
+    log_enc = kd.derive_log_encryption_key(master)
+    assert signing != log_enc
+
+
+def test_derive_log_encryption_key_length(kd: KeyDerivation) -> None:
+    master = b"\x06" * 32
+    key = kd.derive_log_encryption_key(master)
+    assert len(key) == 32

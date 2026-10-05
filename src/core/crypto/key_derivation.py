@@ -2,14 +2,16 @@
 Key derivation primitives for CryptoSafe Manager.
 
 This module is pure cryptography: it has no knowledge of the database,
-events, or GUI. It exposes two independent mechanisms:
+events, or GUI. It exposes:
 
-  * Argon2id  -- for hashing the master password (verification only).
-  * PBKDF2    -- for deriving the AES-256 encryption key (never stored).
+  * Argon2id       -- master password hashing (verification only).
+  * PBKDF2-HMAC    -- main AES-256 encryption key for vault entries.
+  * HKDF-SHA256    -- subkeys derived from the main key material, used
+                      for audit log signing and audit log encryption.
+                      Key separation: each subkey uses a distinct context
+                      string (RFC 5869).
 
-Both mechanisms are configured from `src.core.config`. Configuration is
-validated against hard upper bounds to defend against DoS via maliciously
-large parameters (SEC-4).
+Both Argon2id and PBKDF2 parameters come from `src.core.config`.
 """
 
 from __future__ import annotations
@@ -20,8 +22,8 @@ from dataclasses import dataclass
 from argon2 import PasswordHasher
 from argon2 import Type as Argon2Type
 from argon2.exceptions import VerifyMismatchError, VerificationError
-from argon2.low_level import hash_secret_raw
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from src.core import config
@@ -38,6 +40,16 @@ class KeyDerivationError(Exception):
 
 class InvalidParameterError(KeyDerivationError):
     """Raised when a parameter is outside of its allowed range."""
+
+
+# --------------------------------------------------------------------- #
+# HKDF contexts (key separation, CRY-2)
+# --------------------------------------------------------------------- #
+
+
+CONTEXT_VAULT_ENC = b"cryptosafe-vault-enc"
+CONTEXT_AUDIT_SIGNING = b"cryptosafe-audit-signing"
+CONTEXT_AUDIT_ENC = b"cryptosafe-audit-enc"
 
 
 # --------------------------------------------------------------------- #
@@ -119,8 +131,8 @@ class KeyDerivation:
     """
     Stateless key-derivation service.
 
-    Argon2id parameters are read from `src.core.config` at construction
-    time; PBKDF2 iteration count is also read from config. Use the
+    Argon2id parameters, PBKDF2 iteration count, and HKDF hash algorithm
+    are read from `src.core.config` at construction time. Use the
     `params` property to introspect the effective Argon2 configuration.
     """
 
@@ -143,7 +155,6 @@ class KeyDerivation:
         )
         self._pbkdf2_iterations = _validate_pbkdf2_iterations(pbkdf2_iterations)
 
-        # argon2-cffi's PasswordHasher reuses parameters across calls.
         self._hasher = PasswordHasher(
             time_cost=self._params.time_cost,
             memory_cost=self._params.memory_cost,
@@ -170,25 +181,11 @@ class KeyDerivation:
     # ------------------------------------------------------------------ #
 
     def create_auth_hash(self, password: str) -> str:
-        """
-        Hash the master password with Argon2id.
-
-        The returned string is self-contained: it includes the variant,
-        parameters, and salt. It can be stored as-is in `key_store`
-        (key_type = 'auth_hash').
-        """
         if not password:
             raise ValueError("password must not be empty")
         return self._hasher.hash(password)
 
     def verify_password(self, password: str, stored_hash: str) -> bool:
-        """
-        Verify a password against a stored Argon2id hash.
-
-        Constant-time comparison is provided by argon2-cffi internally;
-        we additionally ensure that verification failures do not raise
-        (HASH-3).
-        """
         if not password or not stored_hash:
             return False
         try:
@@ -198,10 +195,6 @@ class KeyDerivation:
 
     @staticmethod
     def needs_rehash(stored_hash: str) -> bool:
-        """
-        Return True if the stored hash was produced with outdated
-        parameters and should be re-derived. Used on successful login.
-        """
         if not stored_hash:
             return True
         try:
@@ -211,25 +204,28 @@ class KeyDerivation:
             return True
 
     # ------------------------------------------------------------------ #
-    # PBKDF2: encryption key derivation (KEY-1, KEY-2)
+    # Salts
     # ------------------------------------------------------------------ #
 
     @staticmethod
     def generate_salt(length: int = config.PBKDF2_SALT_LEN) -> bytes:
-        """Generate a cryptographically secure random salt."""
         if length < 8 or length > 64:
             raise InvalidParameterError(
                 f"salt length must be in [8, 64], got {length}"
             )
         return secrets.token_bytes(length)
 
+    # ------------------------------------------------------------------ #
+    # PBKDF2: master key derivation (KEY-1, KEY-2)
+    # ------------------------------------------------------------------ #
+
     def derive_encryption_key(self, password: str, salt: bytes) -> bytes:
         """
-        Derive an AES-256 encryption key from the master password.
+        Derive the main 32-byte key material from the master password.
 
-        The key is never stored: it is derived on demand from the
-        password and the persisted salt. The caller is responsible for
-        zeroing the returned bytes once it is no longer needed.
+        This is the *root* key from which subkeys are derived via HKDF.
+        It is never used directly to encrypt data; use
+        `derive_subkey(...)` for that.
         """
         if not password:
             raise ValueError("password must not be empty")
@@ -243,3 +239,71 @@ class KeyDerivation:
             iterations=self._pbkdf2_iterations,
         )
         return kdf.derive(password.encode("utf-8"))
+
+    # ------------------------------------------------------------------ #
+    # HKDF: subkey derivation (CRY-2)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def derive_subkey(
+        master_key: bytes,
+        context: bytes,
+        length: int = 32,
+    ) -> bytes:
+        """
+        Derive a subkey from the master key material via HKDF-SHA256.
+
+        `context` is an application-specific string that provides
+        domain separation between subkeys derived from the same root
+        (e.g. encryption vs. signing vs. audit-log encryption).
+        """
+        if not master_key:
+            raise ValueError("master_key must not be empty")
+        if not context:
+            raise ValueError("context must not be empty")
+        if length < 16 or length > 64:
+            raise InvalidParameterError(
+                f"subkey length must be in [16, 64], got {length}"
+            )
+
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=length,
+            salt=None,           # context already provides separation
+            info=context,
+        )
+        return hkdf.derive(master_key)
+
+    def derive_signing_key(self, master_key: bytes) -> bytes:
+        """
+        Derive the Ed25519 seed (32 bytes) used to sign audit log entries.
+        """
+        return self.derive_subkey(
+            master_key,
+            context=CONTEXT_AUDIT_SIGNING,
+            length=32,
+        )
+
+    def derive_log_encryption_key(self, master_key: bytes) -> bytes:
+        """
+        Derive the AES-256 key used to encrypt audit log entry data
+        at rest (DB-2).
+        """
+        return self.derive_subkey(
+            master_key,
+            context=CONTEXT_AUDIT_ENC,
+            length=32,
+        )
+
+    def derive_vault_encryption_key(self, master_key: bytes) -> bytes:
+        """
+        Derive the AES-256 key used to encrypt vault entries.
+
+        Kept for symmetry with the other contexts; the existing vault
+        code continues to use the master key directly.
+        """
+        return self.derive_subkey(
+            master_key,
+            context=CONTEXT_VAULT_ENC,
+            length=32,
+        )
