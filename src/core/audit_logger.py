@@ -74,7 +74,13 @@ class AuditLogger:
         self._write("user_logged_out", details=f"reason={event.reason}")
 
     def _handle_clipboard_copied(self, event: ClipboardCopied) -> None:
-        self._write("clipboard_copied")
+        self._write(
+            "clipboard_copied",
+            entry_id=event.source_entry_id,
+            details=(
+                f"data_type={event.data_type};timeout={event.timeout}"
+            ),
+        )
 
     def _handle_clipboard_cleared(self, event: ClipboardCleared) -> None:
-        self._write("clipboard_cleared")
+        self._write("clipboard_cleared", details=f"reason={event.reason}")

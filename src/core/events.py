@@ -53,11 +53,31 @@ class UserLoggedOut(Event):
 
 
 class ClipboardCopied(Event):
-    pass
+    """Published after data was copied to the system clipboard."""
+
+    def __init__(
+        self,
+        data_type: str = "text",
+        source_entry_id: str | None = None,
+        timeout: int = 0,
+        timestamp: datetime | None = None,
+    ) -> None:
+        self.data_type = data_type
+        self.source_entry_id = source_entry_id
+        self.timeout = timeout
+        self.timestamp = timestamp or datetime.now()
 
 
 class ClipboardCleared(Event):
-    pass
+    """Published after the clipboard was cleared."""
+
+    def __init__(
+        self,
+        reason: str = "manual",
+        timestamp: datetime | None = None,
+    ) -> None:
+        self.reason = reason
+        self.timestamp = timestamp or datetime.now()
 
 
 EventHandler = Callable[[Event], None]
