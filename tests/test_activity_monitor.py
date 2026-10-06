@@ -1,7 +1,6 @@
 """Tests for src/core/security/activity_monitor.py (ACT-1, ACT-2, PERF-3)."""
 
 import time
-from datetime import datetime
 
 import pytest
 
@@ -13,10 +12,19 @@ from src.core.security.activity_monitor import (
 )
 
 
+def _app_only_config(timeout: int = 1, interval: float = 0.05) -> ActivityConfig:
+    return ActivityConfig(
+        lock_timeout=timeout,
+        check_interval=interval,
+        use_system_idle=False,
+    )
+
+
 def test_config_defaults() -> None:
     cfg = ActivityConfig()
     assert cfg.lock_timeout == 300
     assert cfg.check_interval > 0
+    assert cfg.use_system_idle is True
 
 
 def test_monitor_starts_and_stops() -> None:
@@ -38,8 +46,11 @@ def test_double_start_is_noop() -> None:
 
 
 def test_record_activity_resets_idle() -> None:
-    m = ActivityMonitor(lock_callback=lambda: None)
-    time.sleep(0.1)
+    m = ActivityMonitor(
+        lock_callback=lambda: None,
+        config=_app_only_config(timeout=300, interval=1.0),
+    )
+    time.sleep(0.15)
     idle_before = m.idle_seconds()
     m.record_activity()
     idle_after = m.idle_seconds()
@@ -60,9 +71,10 @@ def test_set_timeout_max_clamped() -> None:
 
 def test_lock_callback_invoked_on_timeout() -> None:
     called = []
-    m = ActivityMonitor(lock_callback=lambda: called.append(time.monotonic()))
-    # Bypass the min clamp for the test.
-    m._config = ActivityConfig(lock_timeout=1, check_interval=0.05)
+    m = ActivityMonitor(
+        lock_callback=lambda: called.append(time.monotonic()),
+        config=_app_only_config(timeout=1, interval=0.05),
+    )
 
     m.start()
     try:
@@ -77,12 +89,13 @@ def test_lock_callback_invoked_on_timeout() -> None:
 
 def test_activity_prevents_lock() -> None:
     called = []
-    m = ActivityMonitor(lock_callback=lambda: called.append(1))
-    m._config = ActivityConfig(lock_timeout=1, check_interval=0.05)
+    m = ActivityMonitor(
+        lock_callback=lambda: called.append(1),
+        config=_app_only_config(timeout=1, interval=0.05),
+    )
 
     m.start()
     try:
-        # Keep recording activity — should not lock.
         for _ in range(20):
             m.record_activity()
             time.sleep(0.05)
@@ -101,8 +114,10 @@ def test_callback_exception_is_swallowed() -> None:
     def bad_callback():
         raise RuntimeError("boom")
 
-    m = ActivityMonitor(lock_callback=bad_callback)
-    m._config = ActivityConfig(lock_timeout=1, check_interval=0.05)
+    m = ActivityMonitor(
+        lock_callback=bad_callback,
+        config=_app_only_config(timeout=1, interval=0.05),
+    )
     m.start()
     try:
         time.sleep(1.3)

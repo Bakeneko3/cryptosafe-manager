@@ -1,11 +1,5 @@
 """
 User activity monitoring for auto-lock.
-
-Tracks both application-level activity (mouse, keyboard, focus) via
-Tk bindings and OS-level activity on Windows via GetLastInputInfo.
-
-The monitor does not lock anything by itself: it invokes a callback
-when the configured idle timeout is exceeded.
 """
 
 from __future__ import annotations
@@ -17,30 +11,19 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 
-# --------------------------------------------------------------------- #
-# Configuration
-# --------------------------------------------------------------------- #
-
-
-DEFAULT_LOCK_TIMEOUT = 300  # 5 minutes
-MIN_LOCK_TIMEOUT = 60       # 1 minute
-MAX_LOCK_TIMEOUT = 8 * 3600  # 8 hours
+DEFAULT_LOCK_TIMEOUT = 300
+MIN_LOCK_TIMEOUT = 60
+MAX_LOCK_TIMEOUT = 8 * 3600
 
 
 @dataclass
 class ActivityConfig:
     lock_timeout: int = DEFAULT_LOCK_TIMEOUT
-    check_interval: float = 1.0  # how often to check the timeout
-
-
-# --------------------------------------------------------------------- #
-# System activity detection (Windows)
-# --------------------------------------------------------------------- #
+    check_interval: float = 1.0
+    use_system_idle: bool = True
 
 
 class _WindowsSystemActivity:
-    """Return system idle time in seconds on Windows."""
-
     class _LASTINPUTINFO(ctypes.Structure):
         _fields_ = [
             ("cbSize", ctypes.c_uint),
@@ -62,25 +45,12 @@ class _WindowsSystemActivity:
         info.cbSize = ctypes.sizeof(info)
         if not self._user32.GetLastInputInfo(ctypes.byref(info)):
             return 0.0
-        # GetTickCount returns a 32-bit wrap-around counter.
         tick_count = self._kernel32.GetTickCount()
         delta = (tick_count - info.dwTime) & 0xFFFFFFFF
         return delta / 1000.0
 
 
-# --------------------------------------------------------------------- #
-# ActivityMonitor
-# --------------------------------------------------------------------- #
-
-
 class ActivityMonitor:
-    """
-    Monitors user activity and fires `lock_callback` when idle time
-    exceeds the configured timeout.
-
-    Thread-safe. `record_activity()` can be called from any thread.
-    """
-
     def __init__(
         self,
         lock_callback: Callable[[], None],
@@ -97,10 +67,6 @@ class ActivityMonitor:
 
         self._windows = _WindowsSystemActivity()
 
-    # ------------------------------------------------------------------ #
-    # Config
-    # ------------------------------------------------------------------ #
-
     @property
     def config(self) -> ActivityConfig:
         return self._config
@@ -114,11 +80,8 @@ class ActivityMonitor:
             self._config = ActivityConfig(
                 lock_timeout=seconds,
                 check_interval=self._config.check_interval,
+                use_system_idle=self._config.use_system_idle,
             )
-
-    # ------------------------------------------------------------------ #
-    # Lifecycle
-    # ------------------------------------------------------------------ #
 
     @property
     def running(self) -> bool:
@@ -150,30 +113,35 @@ class ActivityMonitor:
         with self._lock:
             self._thread = None
 
-    # ------------------------------------------------------------------ #
-    # Activity recording
-    # ------------------------------------------------------------------ #
-
     def record_activity(self) -> None:
         with self._lock:
             self._last_activity = time.monotonic()
 
     def idle_seconds(self) -> float:
-        """Return the effective idle time (app or system, whichever is smaller)."""
+        """
+        Return the effective idle time.
+
+        With use_system_idle=True (default), returns the smaller of the
+        application-level and OS-level idle times — auto-lock fires when
+        neither the app nor the system sees activity.
+
+        With use_system_idle=False, returns only the application-level
+        idle time (useful for tests).
+        """
         with self._lock:
             app_idle = time.monotonic() - self._last_activity
+            use_sys = self._config.use_system_idle
+
+        if not use_sys:
+            return app_idle
+
         sys_idle = self._windows.idle_seconds()
         return min(app_idle, sys_idle)
-
-    # ------------------------------------------------------------------ #
-    # Main loop
-    # ------------------------------------------------------------------ #
 
     def _run(self) -> None:
         while not self._stop_event.wait(self._config.check_interval):
             idle = self.idle_seconds()
             if idle >= self._config.lock_timeout:
-                # Avoid immediate re-trigger.
                 self.record_activity()
                 try:
                     self._lock_callback()
