@@ -113,7 +113,9 @@ class QRViewer(tk.Toplevel):
             Image.LANCZOS,
         )
         self._pil_image = img
-        self._photo = ImageTk.PhotoImage(img)
+
+        # Explicitly bind the PhotoImage to this widget's interpreter.
+        self._photo = ImageTk.PhotoImage(img, master=self.image_label)
         self.image_label.configure(image=self._photo)
 
         self.meta_label.configure(
