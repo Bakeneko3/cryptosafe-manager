@@ -21,11 +21,6 @@ from typing import Callable, Optional
 from src.core.clipboard.platform_adapter import ClipboardAdapter
 
 
-# --------------------------------------------------------------------- #
-# Monitor
-# --------------------------------------------------------------------- #
-
-
 class ClipboardMonitor:
     """
     Polls the clipboard and invokes `on_external_change` when it sees a
@@ -70,7 +65,7 @@ class ClipboardMonitor:
         if self.running:
             return
         self._stop_event.clear()
-        self._last_seen = self._read_safe()
+        self._last_seen = self._read_once()
         self._thread = threading.Thread(
             target=self._run,
             name="ClipboardMonitor",
@@ -106,28 +101,32 @@ class ClipboardMonitor:
 
     def _run(self) -> None:
         while not self._stop_event.wait(self._poll_interval):
-            current = self._read_safe()
-            if current is None and self._errors >= self._max_errors:
-                # We could not read the clipboard repeatedly; degrade.
+            current = self._read_once()
+
+            if self._errors >= self._max_errors:
                 if self._on_failure is not None:
-                    self._on_failure(
-                        "Clipboard monitoring disabled: "
-                        "unable to read the clipboard."
-                    )
+                    try:
+                        self._on_failure(
+                            "Clipboard monitoring disabled: "
+                            "unable to read the clipboard."
+                        )
+                    except Exception:
+                        pass
                 return
 
             if current != self._last_seen:
-                previous = self._last_seen
                 self._last_seen = current
                 try:
                     self._on_external_change(current)
                 except Exception:
                     # A listener must not bring down the monitor.
                     pass
-                # `previous` is intentionally not used further; kept for
-                # potential future diagnostics.
 
-    def _read_safe(self) -> str | None:
+    def _read_once(self) -> str | None:
+        """
+        Read the clipboard once, update the error counter, and return
+        the current value (or None on error).
+        """
         try:
             value = self._adapter.read()
         except Exception:
