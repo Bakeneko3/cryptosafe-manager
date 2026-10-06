@@ -5,7 +5,7 @@ from threading import Lock
 from typing import Callable, Iterator
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class Database:
@@ -85,12 +85,22 @@ class Database:
             );
 
             CREATE TABLE IF NOT EXISTS audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                action TEXT NOT NULL,
+                sequence_number INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                source TEXT NOT NULL,
+                user_id TEXT NOT NULL,
                 entry_id TEXT,
-                details TEXT,
-                signature BLOB
+                previous_hash TEXT NOT NULL,
+                entry_data BLOB NOT NULL,
+                signature TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_public_key (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                public_key TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS settings (
@@ -117,11 +127,14 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_vault_entries_tags
                 ON vault_entries(tags);
 
-            CREATE INDEX IF NOT EXISTS idx_audit_log_entry_id
-                ON audit_log(entry_id);
-
             CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp
                 ON audit_log(timestamp);
+
+            CREATE INDEX IF NOT EXISTS idx_audit_log_event_type
+                ON audit_log(event_type);
+
+            CREATE INDEX IF NOT EXISTS idx_audit_log_entry_id
+                ON audit_log(entry_id);
 
             CREATE INDEX IF NOT EXISTS idx_key_store_key_type
                 ON key_store(key_type);
@@ -171,21 +184,8 @@ class Database:
 
     @staticmethod
     def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
-        """
-        Sprint 3 migration.
-
-        Rebuilds vault_entries with the new per-entry AES-GCM layout
-        (id: TEXT/UUID, encrypted_data: BLOB) and changes
-        audit_log.entry_id to TEXT.
-
-        Any existing rows in vault_entries are dropped: the Sprint 1/2
-        placeholder format is not compatible with the new AES-GCM
-        envelope, and no real user data exists yet (CRUD was not
-        implemented before Sprint 3).
-        """
         cursor = connection.cursor()
 
-        # Drop and rebuild vault_entries.
         cursor.execute("DROP TABLE IF EXISTS vault_entries;")
         cursor.execute(
             """
@@ -199,7 +199,6 @@ class Database:
             """
         )
 
-        # Soft-delete table.
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS deleted_entries (
@@ -211,8 +210,6 @@ class Database:
             """
         )
 
-        # audit_log.entry_id changes from INTEGER to TEXT. SQLite cannot
-        # ALTER COLUMN TYPE, so rebuild it.
         cursor.execute("DROP INDEX IF EXISTS idx_audit_log_entry_id;")
         cursor.execute("DROP INDEX IF EXISTS idx_audit_log_timestamp;")
         cursor.execute("ALTER TABLE audit_log RENAME TO audit_log_old;")
@@ -237,7 +234,6 @@ class Database:
         )
         cursor.execute("DROP TABLE audit_log_old;")
 
-        # Recreate indexes for the new schema.
         cursor.executescript(
             """
             CREATE INDEX IF NOT EXISTS idx_vault_entries_created_at
@@ -253,9 +249,71 @@ class Database:
             """
         )
 
+    @staticmethod
+    def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+        """
+        Sprint 5 migration.
+
+        Replaces audit_log with a tamper-evident schema:
+            sequence_number, timestamp, event_type, severity, source,
+            user_id, entry_id, previous_hash, entry_data, signature
+
+        Adds audit_public_key table (Ed25519 public key, single row).
+
+        Existing audit_log rows are dropped: they were written by the
+        Sprint 1/2 logger without signatures or hash chain and cannot
+        be retroactively verified. The new logger creates a fresh
+        genesis entry on first use.
+        """
+        cursor = connection.cursor()
+
+        # Drop old table and its indexes.
+        cursor.execute("DROP INDEX IF EXISTS idx_audit_log_entry_id;")
+        cursor.execute("DROP INDEX IF EXISTS idx_audit_log_timestamp;")
+        cursor.execute("DROP TABLE IF EXISTS audit_log;")
+
+        cursor.execute(
+            """
+            CREATE TABLE audit_log (
+                sequence_number INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                source TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                entry_id TEXT,
+                previous_hash TEXT NOT NULL,
+                entry_data BLOB NOT NULL,
+                signature TEXT NOT NULL
+            );
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_public_key (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                public_key TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+
+        cursor.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp
+                ON audit_log(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_audit_log_event_type
+                ON audit_log(event_type);
+            CREATE INDEX IF NOT EXISTS idx_audit_log_entry_id
+                ON audit_log(entry_id);
+            """
+        )
+
     _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
         1: _migrate_v1_to_v2.__func__,
         2: _migrate_v2_to_v3.__func__,
+        3: _migrate_v3_to_v4.__func__,
     }
 
     # ------------------------------------------------------------------ #

@@ -6,6 +6,10 @@ Covers:
   * TEST-4  -- concurrent copy operations do not leak.
   * TEST-5  -- no dangling state after simulated failures.
   * PERF-1  -- single copy completes in < 100 ms.
+
+Note: concurrency tests disable the auto-clear timer to avoid
+spawning dozens of threads in a tight loop, which crashes the
+Python 3.14 interpreter inside GC.
 """
 
 import threading
@@ -13,6 +17,7 @@ import time
 
 import pytest
 
+from src.core import config
 from src.core.clipboard.clipboard_service import ClipboardService
 from src.core.events import ClipboardCleared, ClipboardCopied, EventBus
 
@@ -53,13 +58,9 @@ class FakeAdapter:
 
 
 def test_auto_clear_within_tolerance() -> None:
-    """
-    TEST-1: auto-clear happens within ±100 ms of the configured timeout.
-    Uses a very short timeout for the test.
-    """
+    """TEST-1: auto-clear happens within ±100 ms of the configured timeout."""
     adapter = FakeAdapter()
     service = ClipboardService(adapter=adapter, monitor=False)
-    # Bypass sanitize to use a short timeout in tests.
     service._timeout = 1
 
     service.copy("secret")
@@ -84,7 +85,8 @@ def test_auto_clear_within_tolerance() -> None:
 def test_concurrent_copies_do_not_crash() -> None:
     adapter = FakeAdapter()
     service = ClipboardService(adapter=adapter, monitor=False)
-    service._timeout = 60  # long enough not to interfere
+    # Disable timers: we test concurrent access, not timing.
+    service._timeout = config.CLIPBOARD_TIMEOUT_NEVER
 
     errors: list[Exception] = []
 
@@ -102,7 +104,6 @@ def test_concurrent_copies_do_not_crash() -> None:
         t.join()
 
     assert errors == []
-    # At least one copy won; final state must be one of the written values.
     final = adapter.read()
     assert final is not None
     assert final.startswith("data-")
@@ -111,7 +112,7 @@ def test_concurrent_copies_do_not_crash() -> None:
 def test_concurrent_copy_and_clear_consistent() -> None:
     adapter = FakeAdapter()
     service = ClipboardService(adapter=adapter, monitor=False)
-    service._timeout = 60
+    service._timeout = config.CLIPBOARD_TIMEOUT_NEVER
 
     errors: list[Exception] = []
 
@@ -146,7 +147,7 @@ def test_events_not_lost_under_concurrency() -> None:
     adapter = FakeAdapter()
     bus = EventBus()
     service = ClipboardService(bus, adapter=adapter, monitor=False)
-    service._timeout = 60
+    service._timeout = config.CLIPBOARD_TIMEOUT_NEVER
 
     copied: list[ClipboardCopied] = []
     cleared: list[ClipboardCleared] = []
@@ -174,10 +175,6 @@ def test_events_not_lost_under_concurrency() -> None:
 
 
 def test_failed_copy_does_not_leave_state() -> None:
-    """
-    If the adapter fails to copy, the service must not record any
-    active clipboard state (TEST-5).
-    """
     adapter = FakeAdapter()
     adapter.fail_copy = True
 
@@ -193,7 +190,7 @@ def test_adapter_failure_does_not_crash_clear() -> None:
     service = ClipboardService(adapter=adapter, monitor=False)
 
     service.copy("x")
-    adapter.fail_copy = True  # irrelevant; clear uses clear()
+    adapter.fail_copy = True
     assert service.clear() is True
     assert service.status().active is False
 
@@ -205,14 +202,14 @@ def test_service_survives_broken_clear() -> None:
 
     adapter = BrokenClearAdapter()
     service = ClipboardService(adapter=adapter, monitor=False)
+    # Disable the timer: we test the clear() call, not the timeout.
+    service._timeout = config.CLIPBOARD_TIMEOUT_NEVER
 
-    # Clear must not propagate adapter exceptions.
     with pytest.raises(RuntimeError):
         service.clear()
 
-    # State is still active, but service is not corrupted:
-    # a subsequent copy should work.
     assert service.copy("retry") is True
+    service.shutdown()
 
 
 # --------------------------------------------------------------------- #

@@ -396,9 +396,120 @@ def test_migration_v2_to_v3_audit_log_entry_id_is_text(tmp_path: Path) -> None:
     assert entry_id_col[2] == "TEXT"
 
 
-def test_migration_v2_to_v3_preserves_audit_log_rows(tmp_path: Path) -> None:
-    db_path = tmp_path / "v2.db"
-    _create_v2_database(db_path)
+# --------------------------------------------------------------------- #
+# v3 -> v4 migration
+# --------------------------------------------------------------------- #
+
+
+def _create_v3_database(db_path: Path) -> None:
+    """Create a v3 database with the Sprint 3 schema."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE vault_entries (
+                id TEXT PRIMARY KEY,
+                encrypted_data BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                tags TEXT
+            );
+
+            CREATE TABLE deleted_entries (
+                id TEXT PRIMARY KEY,
+                encrypted_data BLOB NOT NULL,
+                deleted_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+
+            CREATE TABLE audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                entry_id TEXT,
+                details TEXT,
+                signature BLOB
+            );
+
+            CREATE TABLE settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                setting_key TEXT NOT NULL UNIQUE,
+                setting_value BLOB,
+                encrypted INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE key_store (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key_type TEXT NOT NULL,
+                key_data BLOB,
+                version INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            PRAGMA user_version = 3;
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_migration_v3_to_v4_updates_version(tmp_path: Path) -> None:
+    db_path = tmp_path / "v3.db"
+    _create_v3_database(db_path)
+    assert _get_user_version(db_path) == 3
+
+    db = Database(db_path)
+    db.close()
+    assert _get_user_version(db_path) == SCHEMA_VERSION
+
+
+def test_migration_v3_to_v4_audit_log_schema(tmp_path: Path) -> None:
+    db_path = tmp_path / "v3.db"
+    _create_v3_database(db_path)
+
+    db = Database(db_path)
+    db.close()
+
+    cols = _table_columns(db_path, "audit_log")
+    for expected in (
+        "sequence_number",
+        "timestamp",
+        "event_type",
+        "severity",
+        "source",
+        "user_id",
+        "entry_id",
+        "previous_hash",
+        "entry_data",
+        "signature",
+    ):
+        assert expected in cols
+
+    # Old columns must be gone.
+    assert "action" not in cols
+    assert "details" not in cols
+
+
+def test_migration_v3_to_v4_creates_public_key_table(tmp_path: Path) -> None:
+    db_path = tmp_path / "v3.db"
+    _create_v3_database(db_path)
+
+    db = Database(db_path)
+    db.close()
+
+    tables = _table_names(db_path)
+    assert "audit_public_key" in tables
+
+    cols = _table_columns(db_path, "audit_public_key")
+    assert "id" in cols
+    assert "public_key" in cols
+    assert "created_at" in cols
+
+
+def test_migration_v3_to_v4_drops_old_audit_rows(tmp_path: Path) -> None:
+    db_path = tmp_path / "v3.db"
+    _create_v3_database(db_path)
 
     conn = sqlite3.connect(db_path)
     try:
@@ -407,15 +518,36 @@ def test_migration_v2_to_v3_preserves_audit_log_rows(tmp_path: Path) -> None:
             INSERT INTO audit_log (action, timestamp, entry_id, details)
             VALUES (?, ?, ?, ?)
             """,
-            ("user_logged_in", "2024-01-01T00:00:00", None, None),
+            ("entry_created", "2024-01-01", "abc", None),
         )
         conn.commit()
     finally:
         conn.close()
 
     db = Database(db_path)
-    rows = db.fetch_all("SELECT action FROM audit_log;")
+    rows = db.fetch_all("SELECT * FROM audit_log")
     db.close()
 
-    assert len(rows) == 1
-    assert rows[0]["action"] == "user_logged_in"
+    # Old rows are dropped, not migrated.
+    assert len(rows) == 0
+
+
+def test_migration_v3_to_v4_indexes_present(tmp_path: Path) -> None:
+    db_path = tmp_path / "v3.db"
+    _create_v3_database(db_path)
+
+    db = Database(db_path)
+    db.close()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    names = {row[0] for row in rows}
+    assert "idx_audit_log_timestamp" in names
+    assert "idx_audit_log_event_type" in names
+    assert "idx_audit_log_entry_id" in names

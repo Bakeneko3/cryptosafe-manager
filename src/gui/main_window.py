@@ -80,11 +80,14 @@ class MainWindow(tk.Tk):
         self.settings_manager = SettingsManager(self.database)
 
         self.event_bus = EventBus()
-        self.audit_logger = AuditLogger(self.database, self.event_bus)
-
         self.key_manager = KeyManager(
             self.database,
             event_bus=self.event_bus,
+        )
+        self.audit_logger = AuditLogger(
+            self.database,
+            self.event_bus,
+            key_manager=self.key_manager,
         )
 
         self.entry_manager = EntryManager(

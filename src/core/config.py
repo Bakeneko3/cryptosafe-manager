@@ -7,7 +7,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 DATABASE_PATH = DATA_DIR / "cryptosafe.db"
 
 ENCRYPTION_ALGORITHM = "AES-256-GCM"
-ENCRYPTION_PLACEHOLDER = True
+ENCRYPTION_PLACEHOLDER = False
 
 DEFAULT_CLIPBOARD_TIMEOUT = 30
 DEFAULT_AUTO_LOCK_TIMEOUT = 300
@@ -48,7 +48,6 @@ PASSWORD_REQUIRE_SYMBOL = True
 
 
 # --- Sprint 2: authentication / session (AUTH-3, AUTH-4) ---
-# Exponential backoff delays (seconds) by failed attempt count.
 AUTH_BACKOFF_DELAYS = {
     1: 1,
     2: 1,
@@ -56,16 +55,50 @@ AUTH_BACKOFF_DELAYS = {
     4: 5,
     5: 30,
 }
-AUTH_BACKOFF_DEFAULT = 30  # for attempts beyond the table
+AUTH_BACKOFF_DEFAULT = 30
 
 
 # --- Sprint 2: key cache (CACHE-2) ---
-# Inactivity timeout (seconds) after which the cached key is dropped.
-KEY_CACHE_INACTIVITY_TIMEOUT = 3600  # 1 hour
-# Whether losing window focus should drop the key cache.
-KEY_CACHE_DROP_ON_FOCUS_LOSS = False  # configurable; default off
+KEY_CACHE_INACTIVITY_TIMEOUT = 3600
+KEY_CACHE_DROP_ON_FOCUS_LOSS = False
 
 
 # --- Sprint 2: key_store schema versioning (KEY-3, DB-1) ---
-# Version tag stored alongside key material for future algorithm upgrades.
 KEY_STORE_VERSION = 1
+
+
+# --- Sprint 4: clipboard (CLIP-2, CFG-1, CFG-3) ---
+# Auto-clear timeout range and default.
+CLIPBOARD_TIMEOUT_DEFAULT = 30
+CLIPBOARD_TIMEOUT_MIN = 5
+CLIPBOARD_TIMEOUT_MAX = 300  # 5 minutes
+CLIPBOARD_TIMEOUT_NEVER = 0  # 0 means "never auto-clear"
+
+# Warning shown N seconds before clearing (UI-3).
+CLIPBOARD_WARNING_SECONDS = 5
+
+# How often the monitor polls the system clipboard (seconds).
+CLIPBOARD_MONITOR_POLL_INTERVAL = 0.5
+
+# Preset profiles (CFG-3).
+CLIPBOARD_PRESETS = {
+    "Standard": {
+        "timeout": 30,
+        "notifications": True,
+        "security_level": "basic",
+    },
+    "Secure": {
+        "timeout": 15,
+        "notifications": True,
+        "security_level": "advanced",
+    },
+    "Public Computer": {
+        "timeout": 5,
+        "notifications": True,
+        "security_level": "paranoid",
+    },
+}
+CLIPBOARD_DEFAULT_PRESET = "Standard"
+
+# Security levels recognized by the service.
+CLIPBOARD_SECURITY_LEVELS = ("basic", "advanced", "paranoid")

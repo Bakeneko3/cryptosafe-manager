@@ -2,7 +2,7 @@
 KeyManager facade for CryptoSafe Manager.
 
 Wires together:
-  * KeyDerivation   -- Argon2id hashing + PBKDF2 key derivation
+  * KeyDerivation   -- Argon2id, PBKDF2, and HKDF subkey derivation
   * KeyCache        -- in-memory encryption key storage
   * AuthSession     -- login/session/failure tracking
   * BackoffPolicy   -- exponential backoff on failed logins
@@ -10,17 +10,15 @@ Wires together:
   * EventBus        -- optional: publishes UserLoggedIn / UserLoggedOut
 
 Public API:
-    * is_initialized()                -- has a vault been created?
-    * create_vault(password)          -- first-run initialization
-    * unlock(password)                -- login, returns (success, backoff_delay)
-    * lock(reason)                    -- lock the vault
-    * get_encryption_key()            -- access the cached key (or None)
-    * change_password(current, new)   -- rotate master password + re-encrypt vault
-
-The master password is never stored. Only the Argon2id hash (for
-verification) and the PBKDF2 salt (for re-derivation) are persisted
-in the key_store table. The derived encryption key lives only in
-KeyCache and is never written to disk (SEC-1, SEC-2).
+    * is_initialized()
+    * create_vault(password)
+    * unlock(password)
+    * lock(reason)
+    * get_encryption_key()
+    * change_password(current, new)
+    * get_audit_salt() -> bytes | None
+    * derive_audit_signing_key() -> bytes | None
+    * derive_audit_log_encryption_key() -> bytes | None
 """
 
 from __future__ import annotations
@@ -58,6 +56,7 @@ NONCE_SIZE = 12
 
 KEY_TYPE_AUTH_HASH = "auth_hash"
 KEY_TYPE_ENC_SALT = "enc_salt"
+KEY_TYPE_AUDIT_SALT = "audit_salt"
 KEY_TYPE_PARAMS = "params"
 
 
@@ -97,6 +96,11 @@ class KeyManager:
         self._backoff = backoff or BackoffPolicy()
         self._session = AuthSession()
 
+        # Keep the derived subkeys in memory while unlocked.
+        self._audit_signing_key: bytes | None = None
+        self._audit_log_enc_key: bytes | None = None
+        self._master_key: bytes | None = None
+
     # ------------------------------------------------------------------ #
     # Introspection
     # ------------------------------------------------------------------ #
@@ -130,6 +134,43 @@ class KeyManager:
         return self._cache.get()
 
     # ------------------------------------------------------------------ #
+    # Audit subkeys (CRY-2, ARC-3)
+    # ------------------------------------------------------------------ #
+
+    def get_audit_salt(self) -> bytes | None:
+        row = self._db.fetch_one(
+            "SELECT key_data FROM key_store WHERE key_type = ? LIMIT 1",
+            (KEY_TYPE_AUDIT_SALT,),
+        )
+        if row is None:
+            return None
+        return bytes(row["key_data"])
+
+    def derive_audit_signing_key(self) -> bytes | None:
+        """
+        Return the Ed25519 seed (32 bytes) for audit log signing.
+        The value is cached while the vault is unlocked.
+        """
+        if not self._cache.unlocked:
+            return None
+        if self._audit_signing_key is not None:
+            return self._audit_signing_key
+        if self._master_key is None:
+            return None
+        self._audit_signing_key = self._kd.derive_signing_key(self._master_key)
+        return self._audit_signing_key
+
+    def derive_audit_log_encryption_key(self) -> bytes | None:
+        if not self._cache.unlocked:
+            return None
+        if self._audit_log_enc_key is not None:
+            return self._audit_log_enc_key
+        if self._master_key is None:
+            return None
+        self._audit_log_enc_key = self._kd.derive_log_encryption_key(self._master_key)
+        return self._audit_log_enc_key
+
+    # ------------------------------------------------------------------ #
     # First-run: create vault
     # ------------------------------------------------------------------ #
 
@@ -146,6 +187,7 @@ class KeyManager:
 
         auth_hash = self._kd.create_auth_hash(password)
         enc_salt = self._kd.generate_salt(config.PBKDF2_SALT_LEN)
+        audit_salt = self._kd.generate_salt(config.PBKDF2_SALT_LEN)
         params = self._build_params_snapshot()
 
         with self._db.transaction():
@@ -159,12 +201,16 @@ class KeyManager:
             )
             self._db.execute_in_transaction(
                 "INSERT INTO key_store (key_type, key_data, version) VALUES (?, ?, ?)",
+                (KEY_TYPE_AUDIT_SALT, audit_salt, config.KEY_STORE_VERSION),
+            )
+            self._db.execute_in_transaction(
+                "INSERT INTO key_store (key_type, key_data, version) VALUES (?, ?, ?)",
                 (KEY_TYPE_PARAMS, json.dumps(params).encode("utf-8"), config.KEY_STORE_VERSION),
             )
 
-        enc_key = self._kd.derive_encryption_key(password, enc_salt)
-        self._cache.store(enc_key)
-        enc_key = b"\x00" * len(enc_key)  # noqa: F841
+        master_key = self._kd.derive_encryption_key(password, enc_salt)
+        self._master_key = master_key
+        self._cache.store(master_key)
 
         self._session.record_login()
         if self._events is not None:
@@ -199,9 +245,9 @@ class KeyManager:
                 backoff_delay=self._backoff.delay_for(attempts),
             )
 
-        enc_key = self._kd.derive_encryption_key(password, enc_salt)
-        self._cache.store(enc_key)
-        enc_key = b"\x00" * len(enc_key)  # noqa: F841
+        master_key = self._kd.derive_encryption_key(password, enc_salt)
+        self._master_key = master_key
+        self._cache.store(master_key)
 
         self._session.record_login()
         if self._events is not None:
@@ -211,6 +257,18 @@ class KeyManager:
     def lock(self, reason: str = "manual") -> None:
         self._cache.lock()
         self._session.record_logout()
+
+        # Wipe cached subkeys.
+        if self._audit_signing_key is not None:
+            self._audit_signing_key = b"\x00" * len(self._audit_signing_key)
+        if self._audit_log_enc_key is not None:
+            self._audit_log_enc_key = b"\x00" * len(self._audit_log_enc_key)
+        if self._master_key is not None:
+            self._master_key = b"\x00" * len(self._master_key)
+        self._audit_signing_key = None
+        self._audit_log_enc_key = None
+        self._master_key = None
+
         if self._events is not None:
             self._events.publish(UserLoggedOut(reason=reason))
 
@@ -255,6 +313,7 @@ class KeyManager:
         old_key = self._kd.derive_encryption_key(current_password, old_salt)
         new_hash = self._kd.create_auth_hash(new_password)
         new_salt = self._kd.generate_salt(config.PBKDF2_SALT_LEN)
+        new_audit_salt = self._kd.generate_salt(config.PBKDF2_SALT_LEN)
         new_key = self._kd.derive_encryption_key(new_password, new_salt)
 
         try:
@@ -268,23 +327,25 @@ class KeyManager:
                     "UPDATE key_store SET key_data = ?, version = ? WHERE key_type = ?",
                     (new_salt, config.KEY_STORE_VERSION, KEY_TYPE_ENC_SALT),
                 )
+                self._db.execute_in_transaction(
+                    "UPDATE key_store SET key_data = ?, version = ? WHERE key_type = ?",
+                    (new_audit_salt, config.KEY_STORE_VERSION, KEY_TYPE_AUDIT_SALT),
+                )
         finally:
             old_key = b"\x00" * len(old_key)  # noqa: F841
 
+        self._master_key = new_key
         self._cache.store(new_key)
-        new_key = b"\x00" * len(new_key)  # noqa: F841
+
+        # Subkeys are invalidated; they will be re-derived lazily.
+        self._audit_signing_key = None
+        self._audit_log_enc_key = None
 
         self._session.record_login()
         if self._events is not None:
             self._events.publish(UserLoggedIn())
 
     def _re_encrypt_all_entries(self, old_key: bytes, new_key: bytes) -> None:
-        """
-        Decrypt every vault entry with old_key and re-encrypt with new_key.
-
-        Runs in a single transaction; on any failure the transaction
-        rolls back, leaving the vault unchanged (CHANGE-4).
-        """
         old_aesgcm = AESGCM(bytes(old_key))
         new_aesgcm = AESGCM(bytes(new_key))
 
@@ -297,11 +358,9 @@ class KeyManager:
                 entry_id = row["id"]
                 blob = bytes(row["encrypted_data"])
 
-                # Split envelope.
                 nonce = blob[:NONCE_SIZE]
                 ct_and_tag = blob[NONCE_SIZE:]
 
-                # Decrypt with old key.
                 try:
                     plaintext = old_aesgcm.decrypt(nonce, ct_and_tag, None)
                 except InvalidTag as exc:
@@ -310,7 +369,6 @@ class KeyManager:
                         f"authentication failed."
                     ) from exc
 
-                # Encrypt with new key, fresh nonce.
                 new_nonce = os.urandom(NONCE_SIZE)
                 new_ct_and_tag = new_aesgcm.encrypt(new_nonce, plaintext, None)
                 new_blob = new_nonce + new_ct_and_tag

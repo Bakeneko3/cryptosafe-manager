@@ -272,7 +272,12 @@ class ClipboardService:
         self._warning_timer.start()
 
     def _on_timeout(self) -> None:
-        self.clear(reason="timeout")
+        try:
+            self.clear(reason="timeout")
+        except Exception:
+            # Timers must never crash with an unhandled exception.
+            # See ERR-2 in Sprint 4 requirements.
+            pass
 
     def _on_warning_timer(self) -> None:
         if self._on_warning is None:

@@ -1,4 +1,4 @@
-"""Tests for src/core/key_manager.py (Sprint 2/3)."""
+"""Tests for src/core/key_manager.py (Sprint 2/3/5)."""
 
 from pathlib import Path
 
@@ -6,6 +6,7 @@ import pytest
 
 from src.core.crypto.key_derivation import KeyDerivation
 from src.core.key_manager import (
+    KEY_TYPE_AUDIT_SALT,
     KEY_TYPE_AUTH_HASH,
     KEY_TYPE_ENC_SALT,
     KEY_TYPE_PARAMS,
@@ -84,11 +85,16 @@ def test_create_vault_twice_raises(km: KeyManager) -> None:
 # --------------------------------------------------------------------- #
 
 
-def test_create_vault_writes_three_records(km: KeyManager, db: Database) -> None:
+def test_create_vault_writes_four_records(km: KeyManager, db: Database) -> None:
     km.create_vault(STRONG)
     rows = db.fetch_all("SELECT key_type FROM key_store ORDER BY key_type")
     types = {r["key_type"] for r in rows}
-    assert types == {KEY_TYPE_AUTH_HASH, KEY_TYPE_ENC_SALT, KEY_TYPE_PARAMS}
+    assert types == {
+        KEY_TYPE_AUTH_HASH,
+        KEY_TYPE_ENC_SALT,
+        KEY_TYPE_AUDIT_SALT,
+        KEY_TYPE_PARAMS,
+    }
 
 
 def test_master_password_is_never_stored(km: KeyManager, db: Database) -> None:
@@ -462,17 +468,14 @@ def test_change_password_atomic_rollback_on_failure(
     """
     km.create_vault(STRONG)
 
-    # Insert one valid entry.
     service = AESGCMService(km)
     _insert_dummy_entry(db, "entry", service.encrypt(b"data"))
 
-    # Insert one bogus entry that will fail to decrypt during re-encryption.
     _insert_dummy_entry(db, "bogus", b"\xff" * 40)
 
     with pytest.raises(RuntimeError):
         km.change_password(STRONG, NEW_STRONG)
 
-    # Old password must still unlock.
     km.lock()
     assert km.unlock(STRONG).success is True
     assert km.unlock(NEW_STRONG).success is False
@@ -503,13 +506,11 @@ def test_test5_password_change_integration(
         km = KeyManager(db, key_derivation=fast_kd)
         km.create_vault(PASSWORD_A)
 
-        # Step 2: add 10 entries, encrypting each with the current key.
         service = AESGCMService(km)
         plaintexts = [f"secret-number-{i}".encode("utf-8") for i in range(10)]
         for i, pt in enumerate(plaintexts):
             _insert_dummy_entry(db, f"entry-{i}", service.encrypt(pt))
 
-        # Step 3: lock / unlock with A, verify all entries readable.
         km.lock()
         assert km.unlock(PASSWORD_A).success is True
         service_a = AESGCMService(km)
@@ -520,10 +521,8 @@ def test_test5_password_change_integration(
         }
         assert decrypted_a == set(plaintexts)
 
-        # Step 4: rotate to password B.
         km.change_password(PASSWORD_A, PASSWORD_B)
 
-        # Step 5: lock, unlock with B, verify all entries readable.
         km.lock()
         assert km.unlock(PASSWORD_B).success is True
         service_b = AESGCMService(km)
@@ -534,8 +533,76 @@ def test_test5_password_change_integration(
         }
         assert decrypted_b == set(plaintexts)
 
-        # Step 6: old password A must no longer unlock.
         km.lock()
         assert km.unlock(PASSWORD_A).success is False
     finally:
         db.close()
+
+
+# --------------------------------------------------------------------- #
+# Sprint 5: audit salt and subkeys (CRY-2, ARC-3)
+# --------------------------------------------------------------------- #
+
+
+def test_create_vault_stores_audit_salt(km: KeyManager) -> None:
+    km.create_vault(STRONG)
+    salt = km.get_audit_salt()
+    assert salt is not None
+    assert len(salt) == 16
+
+
+def test_audit_salt_differs_from_enc_salt(km: KeyManager) -> None:
+    km.create_vault(STRONG)
+    audit_salt = km.get_audit_salt()
+
+    row = km._db.fetch_one(
+        "SELECT key_data FROM key_store WHERE key_type = ?",
+        (KEY_TYPE_ENC_SALT,),
+    )
+    enc_salt = bytes(row["key_data"])
+    assert audit_salt != enc_salt
+
+
+def test_derive_audit_signing_key_returns_32_bytes(km: KeyManager) -> None:
+    km.create_vault(STRONG)
+    key = km.derive_audit_signing_key()
+    assert key is not None
+    assert len(key) == 32
+
+
+def test_derive_audit_log_encryption_key_returns_32_bytes(km: KeyManager) -> None:
+    km.create_vault(STRONG)
+    key = km.derive_audit_log_encryption_key()
+    assert key is not None
+    assert len(key) == 32
+
+
+def test_signing_key_and_log_key_differ(km: KeyManager) -> None:
+    km.create_vault(STRONG)
+    signing = km.derive_audit_signing_key()
+    log_enc = km.derive_audit_log_encryption_key()
+    assert signing != log_enc
+
+
+def test_subkeys_are_deterministic(km: KeyManager) -> None:
+    km.create_vault(STRONG)
+    signing1 = bytes(km.derive_audit_signing_key())
+    km.lock()
+    km.unlock(STRONG)
+    signing2 = bytes(km.derive_audit_signing_key())
+    assert signing1 == signing2
+
+
+def test_subkeys_unavailable_when_locked(km: KeyManager) -> None:
+    km.create_vault(STRONG)
+    km.lock()
+    assert km.derive_audit_signing_key() is None
+    assert km.derive_audit_log_encryption_key() is None
+
+
+def test_audit_salt_changes_on_password_change(km: KeyManager) -> None:
+    km.create_vault(STRONG)
+    old_salt = km.get_audit_salt()
+    km.change_password(STRONG, NEW_STRONG)
+    new_salt = km.get_audit_salt()
+    assert old_salt != new_salt

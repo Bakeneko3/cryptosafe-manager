@@ -1,86 +1,10 @@
-from datetime import datetime, timezone
+"""
+Compatibility shim.
 
-from src.core.events import (
-    ClipboardCleared,
-    ClipboardCopied,
-    EntryCreated,
-    EntryDeleted,
-    EntryUpdated,
-    EventBus,
-    UserLoggedIn,
-    UserLoggedOut,
-)
-from src.database.db import Database
+The real implementation lives in src/core/audit/audit_logger.py since
+Sprint 5. This module re-exports it so existing imports keep working.
+"""
 
+from src.core.audit.audit_logger import AuditLogger
 
-class AuditLogger:
-    """Writes application events to the audit_log table."""
-
-    def __init__(self, database: Database, event_bus: EventBus):
-        self.database = database
-        self.event_bus = event_bus
-
-        self._subscribe()
-
-    def _subscribe(self) -> None:
-        self.event_bus.subscribe(EntryCreated, self._handle_entry_created)
-        self.event_bus.subscribe(EntryUpdated, self._handle_entry_updated)
-        self.event_bus.subscribe(EntryDeleted, self._handle_entry_deleted)
-
-        self.event_bus.subscribe(UserLoggedIn, self._handle_user_logged_in)
-        self.event_bus.subscribe(UserLoggedOut, self._handle_user_logged_out)
-
-        self.event_bus.subscribe(ClipboardCopied, self._handle_clipboard_copied)
-        self.event_bus.subscribe(ClipboardCleared, self._handle_clipboard_cleared)
-
-    def _write(
-        self,
-        action: str,
-        entry_id: str | None = None,
-        details: str | None = None,
-    ) -> None:
-        timestamp = datetime.now(timezone.utc).isoformat()
-
-        self.database.execute(
-            """
-            INSERT INTO audit_log (
-                action,
-                timestamp,
-                entry_id,
-                details
-            )
-            VALUES (?, ?, ?, ?)
-            """,
-            (action, timestamp, entry_id, details),
-        )
-
-    def _handle_entry_created(self, event: EntryCreated) -> None:
-        self._write("entry_created", entry_id=event.entry_id)
-
-    def _handle_entry_updated(self, event: EntryUpdated) -> None:
-        self._write("entry_updated", entry_id=event.entry_id)
-
-    def _handle_entry_deleted(self, event: EntryDeleted) -> None:
-        self._write(
-            "entry_deleted",
-            entry_id=event.entry_id,
-            details=f"soft={event.soft}",
-        )
-
-    def _handle_user_logged_in(self, event: UserLoggedIn) -> None:
-        self._write("user_logged_in")
-
-    def _handle_user_logged_out(self, event: UserLoggedOut) -> None:
-        self._write("user_logged_out", details=f"reason={event.reason}")
-
-    def _handle_clipboard_copied(self, event: ClipboardCopied) -> None:
-        self._write(
-            "clipboard_copied",
-            entry_id=event.source_entry_id,
-            details=(
-                f"data_type={event.data_type};timeout={event.timeout}"
-            ),
-        )
-
-    def _handle_clipboard_cleared(self, event: ClipboardCleared) -> None:
-        self._write("clipboard_cleared", details=f"reason={event.reason}")
+__all__ = ["AuditLogger"]
