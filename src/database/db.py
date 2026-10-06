@@ -1,7 +1,7 @@
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from threading import Lock
+from threading import RLock
 from typing import Callable, Iterator
 
 
@@ -11,16 +11,18 @@ SCHEMA_VERSION = 5
 class Database:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
-        self._lock = Lock()
+        self._lock = RLock()
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._connection = sqlite3.connect(
             self.db_path,
             check_same_thread=False,
+            isolation_level=None,   # we manage transactions explicitly
         )
 
         self._connection.row_factory = sqlite3.Row
+        self._tx_depth = 0
 
         self._initialize()
 
@@ -40,7 +42,6 @@ class Database:
             if version == 0:
                 self._create_schema()
                 self._set_user_version(SCHEMA_VERSION)
-                self._connection.commit()
                 return
 
             if version > SCHEMA_VERSION:
@@ -60,8 +61,6 @@ class Database:
                 migration(self._connection)
                 version += 1
                 self._set_user_version(version)
-
-            self._connection.commit()
 
     def _set_user_version(self, version: int) -> None:
         self._connection.execute(f"PRAGMA user_version = {int(version)};")
@@ -343,11 +342,6 @@ class Database:
 
     @staticmethod
     def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
-        """
-        Sprint 6 migration.
-
-        Adds tables for import/export history, sharing, and contacts.
-        """
         cursor = connection.cursor()
 
         cursor.executescript(
@@ -426,23 +420,50 @@ class Database:
             return cursor.fetchone()
 
     # ------------------------------------------------------------------ #
-    # Transactions
+    # Transactions (supports nesting via SAVEPOINTs)
     # ------------------------------------------------------------------ #
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
+        """
+        Context manager wrapping a SQLite transaction.
+
+        Supports nesting via SAVEPOINTs. The outermost transaction
+        controls the actual COMMIT / ROLLBACK; inner transactions only
+        release or roll back to their savepoint.
+        """
         with self._lock:
-            try:
+            depth = self._tx_depth
+            savepoint_name = f"sp_{depth}"
+
+            if depth == 0:
                 self._connection.execute("BEGIN;")
-            except sqlite3.OperationalError:
-                pass
+            else:
+                self._connection.execute(f"SAVEPOINT {savepoint_name};")
+
+            self._tx_depth = depth + 1
             try:
                 yield
             except Exception:
-                self._connection.rollback()
+                self._tx_depth = depth
+                if depth == 0:
+                    self._connection.execute("ROLLBACK;")
+                else:
+                    self._connection.execute(
+                        f"ROLLBACK TO SAVEPOINT {savepoint_name};"
+                    )
+                    self._connection.execute(
+                        f"RELEASE SAVEPOINT {savepoint_name};"
+                    )
                 raise
             else:
-                self._connection.commit()
+                self._tx_depth = depth
+                if depth == 0:
+                    self._connection.execute("COMMIT;")
+                else:
+                    self._connection.execute(
+                        f"RELEASE SAVEPOINT {savepoint_name};"
+                    )
 
     def execute_in_transaction(self, query: str, parameters: tuple = ()):
         return self._connection.execute(query, parameters)
