@@ -3,6 +3,7 @@ cryptography==50.0.1
 argon2-cffi==25.1.0
 pyperclip==1.11.0
 pywin32==312
+reportlab==5.0.1
 
 # Dev / test
 pytest==9.1.1
