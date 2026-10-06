@@ -12,3 +12,4 @@ pystray==0.19.5
 # Dev / test
 pytest==9.1.1
 pytest-cov==7.1.0
+pyinstaller==6.22.3

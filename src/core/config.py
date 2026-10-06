@@ -1,7 +1,27 @@
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+import sys
+
+
+def _get_project_root() -> Path:
+    """
+    Return the project root directory.
+
+    When running from source, this is the repository root (two levels
+    above this file).
+
+    When running from a PyInstaller bundle, this is the directory that
+    contains the executable, so that `data/` is written next to the
+    `.exe` and not inside the temporary extraction folder.
+    """
+    if getattr(sys, "frozen", False):
+        # PyInstaller bundle: use the executable's directory.
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
+PROJECT_ROOT = _get_project_root()
 
 DATA_DIR = PROJECT_ROOT / "data"
 DATABASE_PATH = DATA_DIR / "cryptosafe.db"
