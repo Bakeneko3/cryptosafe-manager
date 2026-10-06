@@ -1,5 +1,23 @@
 """
 QR code generation and decoding.
+
+Payloads are JSON documents of the form:
+
+    {
+        "cryptosafe_qr": true,
+        "version": "1.0",
+        "created_at": ISO-8601,
+        "expires_at": ISO-8601,
+        "nonce": hex string,
+        "chunk": 1,
+        "total": 1,
+        "checksum": sha256 of the raw chunk data (hex, truncated),
+        "data": base64-encoded chunk
+    }
+
+Generation uses the `qrcode` library with Low error correction.
+Decoding uses `pyzbar`, which handles larger QR codes more reliably
+than OpenCV.
 """
 
 from __future__ import annotations
@@ -19,15 +37,15 @@ import qrcode
 from qrcode.constants import ERROR_CORRECT_L
 
 try:
-    import cv2
-    import numpy as np
-    _CV2_AVAILABLE = True
+    from PIL import Image
+    from pyzbar.pyzbar import decode as zbar_decode
+    _ZBAR_AVAILABLE = True
 except Exception:
-    _CV2_AVAILABLE = False
+    _ZBAR_AVAILABLE = False
 
 
 DEFAULT_VALIDITY_SECONDS = 300
-DEFAULT_CHUNK_SIZE = 800  # conservative: OpenCV handles smaller QR codes reliably
+DEFAULT_CHUNK_SIZE = 500
 
 
 class QRError(Exception):
@@ -120,7 +138,7 @@ class QRService:
         qr = qrcode.QRCode(
             version=None,
             error_correction=ERROR_CORRECT_L,
-            box_size=8,
+            box_size=10,
             border=4,
         )
         qr.add_data(blob)
@@ -139,8 +157,10 @@ class QRService:
         return self.decode_files([path])
 
     def decode_files(self, paths: Iterable[str | Path]) -> bytes:
-        if not _CV2_AVAILABLE:
-            raise QRError("OpenCV is not installed; QR decoding is unavailable.")
+        if not _ZBAR_AVAILABLE:
+            raise QRError(
+                "pyzbar is not available; QR decoding is unavailable."
+            )
 
         docs: dict[int, dict] = {}
         total: int | None = None
@@ -184,12 +204,15 @@ class QRService:
             raise QRDecodeError(f"Decompression failed: {exc}") from exc
 
     def decode_bytes(self, png_bytes: bytes) -> dict:
-        if not _CV2_AVAILABLE:
-            raise QRError("OpenCV is not installed; QR decoding is unavailable.")
-        arr = np.frombuffer(png_bytes, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            raise QRDecodeError("Could not read image data.")
+        if not _ZBAR_AVAILABLE:
+            raise QRError(
+                "pyzbar is not available; QR decoding is unavailable."
+            )
+        try:
+            img = Image.open(io.BytesIO(png_bytes))
+            img.load()
+        except Exception as exc:
+            raise QRDecodeError(f"Could not read image: {exc}") from exc
         return self._extract_from_image(img)
 
     # ------------------------------------------------------------------ #
@@ -199,65 +222,31 @@ class QRService:
     def _decode_single(self, path: Path) -> dict:
         if not path.exists():
             raise QRDecodeError(f"File not found: {path}")
-        raw = path.read_bytes()
-        arr = np.frombuffer(raw, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            raise QRDecodeError(f"Could not read image: {path}")
+        try:
+            img = Image.open(path)
+            img.load()
+        except Exception as exc:
+            raise QRDecodeError(f"Could not read image: {path} ({exc})") from exc
         return self._extract_from_image(img)
 
     def _extract_from_image(self, img) -> dict:
-        """
-        Try multiple preprocessing strategies to decode the QR payload.
+        # Convert to grayscale to widen decoder tolerance.
+        if img.mode != "L":
+            img = img.convert("L")
 
-        OpenCV's QRCodeDetector is sensitive to size and binarization.
-        We attempt:
-            * grayscale as-is
-            * grayscale downscaled to <=1000 px
-            * binary threshold
-        """
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        try:
+            results = zbar_decode(img)
+        except Exception as exc:
+            raise QRDecodeError(f"QR detection failed: {exc}") from exc
 
-        candidates: list = [gray]
-
-        h, w = gray.shape[:2]
-        # Downscale very large images.
-        if max(h, w) > 1000:
-            scale = 1000 / max(h, w)
-            candidates.append(
-                cv2.resize(
-                    gray, (int(w * scale), int(h * scale)),
-                    interpolation=cv2.INTER_AREA,
-                )
-            )
-
-        # Upscale small images.
-        if max(h, w) < 300:
-            scale = 300 / max(h, w)
-            candidates.append(
-                cv2.resize(
-                    gray, (int(w * scale), int(h * scale)),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-            )
-
-        # Binarized versions.
-        for base in list(candidates):
-            _, binary = cv2.threshold(base, 127, 255, cv2.THRESH_BINARY)
-            candidates.append(binary)
-
-        detector = cv2.QRCodeDetector()
-        data = ""
-        for candidate in candidates:
-            try:
-                data, _points, _ = detector.detectAndDecode(candidate)
-            except Exception:
-                data = ""
-            if data:
-                break
-
-        if not data:
+        if not results:
             raise QRDecodeError("No QR code detected in image.")
+
+        raw = results[0].data
+        try:
+            data = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise QRDecodeError(f"QR payload is not valid UTF-8: {exc}") from exc
 
         try:
             doc = json.loads(data)

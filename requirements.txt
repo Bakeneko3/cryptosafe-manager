@@ -6,7 +6,7 @@ pywin32==312
 reportlab==5.0.1
 qrcode==8.0
 Pillow==11.0.0
-opencv-python==5.0.0.93
+pyzbar==0.1.9
 
 # Dev / test
 pytest==9.1.1

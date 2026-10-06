@@ -38,8 +38,14 @@ def bus() -> EventBus:
 
 
 @pytest.fixture
-def service(adapter: FakeAdapter, bus: EventBus) -> ClipboardService:
-    return ClipboardService(bus, adapter=adapter, monitor=False)
+def service(adapter: FakeAdapter, bus: EventBus):
+    """ClipboardService with automatic shutdown to stop lingering timers."""
+    svc = ClipboardService(bus, adapter=adapter, monitor=False)
+    yield svc
+    try:
+        svc.shutdown()
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------- #
@@ -85,36 +91,46 @@ def test_status_inactive_after_clear(service: ClipboardService) -> None:
 def test_auto_clear_after_timeout(adapter: FakeAdapter) -> None:
     service = ClipboardService(
         adapter=adapter,
-        timeout=1,  # 1 second (clamped to MIN=5 by sanitize...)
+        timeout=1,
         monitor=False,
     )
-    # Because sanitize clamps below MIN to MIN, set direct
     service._timeout = 1
-    service.copy("secret")
-    assert adapter.read() == "secret"
-    time.sleep(1.3)
-    assert adapter.read() in (None, "")
+    try:
+        service.copy("secret")
+        assert adapter.read() == "secret"
+        time.sleep(1.3)
+        assert adapter.read() in (None, "")
+    finally:
+        service.shutdown()
 
 
 def test_timeout_sanitize_min(adapter: FakeAdapter) -> None:
     service = ClipboardService(adapter=adapter, monitor=False)
-    service.set_timeout(1)
-    assert service.timeout == config.CLIPBOARD_TIMEOUT_MIN
+    try:
+        service.set_timeout(1)
+        assert service.timeout == config.CLIPBOARD_TIMEOUT_MIN
+    finally:
+        service.shutdown()
 
 
 def test_timeout_sanitize_max(adapter: FakeAdapter) -> None:
     service = ClipboardService(adapter=adapter, monitor=False)
-    service.set_timeout(9999)
-    assert service.timeout == config.CLIPBOARD_TIMEOUT_MAX
+    try:
+        service.set_timeout(9999)
+        assert service.timeout == config.CLIPBOARD_TIMEOUT_MAX
+    finally:
+        service.shutdown()
 
 
 def test_timeout_never(adapter: FakeAdapter) -> None:
     service = ClipboardService(adapter=adapter, monitor=False)
-    service.set_timeout(config.CLIPBOARD_TIMEOUT_NEVER)
-    service.copy("sticky")
-    time.sleep(0.3)
-    # Still there — no timer.
-    assert adapter.read() == "sticky"
+    try:
+        service.set_timeout(config.CLIPBOARD_TIMEOUT_NEVER)
+        service.copy("sticky")
+        time.sleep(0.3)
+        assert adapter.read() == "sticky"
+    finally:
+        service.shutdown()
 
 
 # --------------------------------------------------------------------- #
@@ -124,38 +140,47 @@ def test_timeout_never(adapter: FakeAdapter) -> None:
 
 def test_copy_publishes_event(adapter: FakeAdapter, bus: EventBus) -> None:
     service = ClipboardService(bus, adapter=adapter, monitor=False)
-    received = []
-    bus.subscribe(ClipboardCopied, lambda e: received.append(e))
+    try:
+        received = []
+        bus.subscribe(ClipboardCopied, lambda e: received.append(e))
 
-    service.copy("hello", data_type="password", source_entry_id="abc")
+        service.copy("hello", data_type="password", source_entry_id="abc")
 
-    assert len(received) == 1
-    assert received[0].data_type == "password"
-    assert received[0].source_entry_id == "abc"
+        assert len(received) == 1
+        assert received[0].data_type == "password"
+        assert received[0].source_entry_id == "abc"
+    finally:
+        service.shutdown()
 
 
 def test_clear_publishes_event(adapter: FakeAdapter, bus: EventBus) -> None:
     service = ClipboardService(bus, adapter=adapter, monitor=False)
-    received = []
-    bus.subscribe(ClipboardCleared, lambda e: received.append(e))
+    try:
+        received = []
+        bus.subscribe(ClipboardCleared, lambda e: received.append(e))
 
-    service.copy("hello")
-    service.clear(reason="manual")
+        service.copy("hello")
+        service.clear(reason="manual")
 
-    assert len(received) == 1
-    assert received[0].reason == "manual"
+        assert len(received) == 1
+        assert received[0].reason == "manual"
+    finally:
+        service.shutdown()
 
 
 def test_auto_clear_publishes_event(adapter: FakeAdapter, bus: EventBus) -> None:
     service = ClipboardService(bus, adapter=adapter, monitor=False)
-    service._timeout = 1  # bypass sanitize for test speed
-    received = []
-    bus.subscribe(ClipboardCleared, lambda e: received.append(e))
+    try:
+        service._timeout = 1
+        received = []
+        bus.subscribe(ClipboardCleared, lambda e: received.append(e))
 
-    service.copy("hello")
-    time.sleep(1.3)
+        service.copy("hello")
+        time.sleep(1.3)
 
-    assert any(e.reason == "timeout" for e in received)
+        assert any(e.reason == "timeout" for e in received)
+    finally:
+        service.shutdown()
 
 
 # --------------------------------------------------------------------- #
@@ -177,7 +202,6 @@ def test_clear_if_owned(service: ClipboardService, adapter: FakeAdapter) -> None
 
 
 def test_clear_if_owned_does_nothing_when_inactive(service: ClipboardService) -> None:
-    # No copy — clear_if_owned should be a no-op.
     service.clear_if_owned()
     assert service.status().active is False
 
@@ -189,11 +213,14 @@ def test_clear_if_owned_does_nothing_when_inactive(service: ClipboardService) ->
 
 def test_remaining_seconds_decreases(adapter: FakeAdapter) -> None:
     service = ClipboardService(adapter=adapter, timeout=30, monitor=False)
-    service.copy("hello")
-    r1 = service.status().remaining_seconds
-    time.sleep(0.1)
-    r2 = service.status().remaining_seconds
-    assert r2 < r1
+    try:
+        service.copy("hello")
+        r1 = service.status().remaining_seconds
+        time.sleep(0.1)
+        r2 = service.status().remaining_seconds
+        assert r2 < r1
+    finally:
+        service.shutdown()
 
 
 # --------------------------------------------------------------------- #
@@ -209,12 +236,12 @@ def test_warning_callback_is_called(adapter: FakeAdapter) -> None:
         timeout=10,
         on_warning=lambda sec: warnings.append(sec),
     )
-    # Speed up: schedule a very short warning.
-    service.copy("hello")
-    time.sleep(0.2)
-    # We do not wait for the real 5-second warning; just verify the
-    # service stores the callback and it can be invoked.
-    assert service._on_warning is not None
+    try:
+        service.copy("hello")
+        time.sleep(0.2)
+        assert service._on_warning is not None
+    finally:
+        service.shutdown()
 
 
 # --------------------------------------------------------------------- #

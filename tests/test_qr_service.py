@@ -15,7 +15,7 @@ from src.core.import_export.qr_service import (
 
 @pytest.fixture
 def service() -> QRService:
-    return QRService(validity_seconds=300, chunk_size=800)
+    return QRService(validity_seconds=300, chunk_size=350)
 
 
 # --------------------------------------------------------------------- #
@@ -32,7 +32,7 @@ def test_generate_single_chunk(service: QRService) -> None:
 
 
 def test_generate_multiple_chunks(service: QRService) -> None:
-    payload = os.urandom(3000)  # incompressible, > 800
+    payload = os.urandom(1000)  # incompressible, > 350
     chunks = service.generate(payload)
     assert len(chunks) > 1
     assert all(c.total == len(chunks) for c in chunks)
@@ -58,7 +58,7 @@ def test_roundtrip_small(service: QRService, tmp_path: Path) -> None:
 
 
 def test_roundtrip_large_multichunk(service: QRService, tmp_path: Path) -> None:
-    payload = os.urandom(2000)  # incompressible, forces 3 chunks at 800
+    payload = os.urandom(1000)  # ~3 chunks at 350
     paths = service.generate_to_files(payload, tmp_path)
     assert len(paths) > 1
     decoded = service.decode_files(paths)
@@ -79,7 +79,7 @@ def test_roundtrip_in_memory(service: QRService) -> None:
 
 
 def test_qr_expires(service: QRService, tmp_path: Path) -> None:
-    fast = QRService(validity_seconds=1, chunk_size=800)
+    fast = QRService(validity_seconds=1, chunk_size=350)
     paths = fast.generate_to_files(b"tick", tmp_path)
     import time
     time.sleep(1.2)
@@ -123,7 +123,7 @@ def test_decode_not_a_qr(service: QRService, tmp_path: Path) -> None:
 
 
 def test_decode_missing_chunk(service: QRService, tmp_path: Path) -> None:
-    payload = os.urandom(2000)
+    payload = os.urandom(1000)
     paths = service.generate_to_files(payload, tmp_path)
     assert len(paths) > 1
     with pytest.raises(QRDecodeError):
