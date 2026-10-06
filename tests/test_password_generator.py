@@ -190,6 +190,8 @@ def test_no_duplicates_in_history_short_window() -> None:
 # --------------------------------------------------------------------- #
 
 
+@pytest.mark.slow
+@pytest.mark.perf
 def test_bulk_generation_unique_and_compliant() -> None:
     """TEST-4 (reduced): 1000 generations, check uniqueness + policy."""
     gen = PasswordGenerator(GeneratorConfig(length=16), history_size=20)

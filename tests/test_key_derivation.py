@@ -173,6 +173,7 @@ def test_derive_encryption_key_requires_min_salt_length(kd: KeyDerivation) -> No
 # --------------------------------------------------------------------- #
 
 
+@pytest.mark.slow
 def test_derive_encryption_key_is_deterministic(kd: KeyDerivation) -> None:
     """TEST-2: 100 derivations with the same inputs must match."""
     salt = kd.generate_salt()

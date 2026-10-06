@@ -132,6 +132,8 @@ def test_data_consistency_after_mixed_operations(em: EntryManager) -> None:
 # --------------------------------------------------------------------- #
 
 
+@pytest.mark.slow
+@pytest.mark.perf
 def test_perf_load_1000_entries(em: EntryManager) -> None:
     for i in range(1000):
         em.create_entry(_make_entry(i))
@@ -149,6 +151,8 @@ def test_perf_load_1000_entries(em: EntryManager) -> None:
 # --------------------------------------------------------------------- #
 
 
+@pytest.mark.slow
+@pytest.mark.perf
 def test_perf_search_1000_entries(em: EntryManager) -> None:
     for i in range(1000):
         em.create_entry(_make_entry(i))
@@ -163,6 +167,8 @@ def test_perf_search_1000_entries(em: EntryManager) -> None:
     assert elapsed < 0.2, f"Search took {elapsed:.3f}s"
 
 
+@pytest.mark.slow
+@pytest.mark.perf
 def test_perf_field_filter_1000_entries(em: EntryManager) -> None:
     for i in range(1000):
         em.create_entry(_make_entry(i))
