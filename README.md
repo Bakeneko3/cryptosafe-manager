@@ -2,13 +2,13 @@
 
 CryptoSafe Manager is a cross-platform desktop password manager developed as an applied cryptography project.
 
-The application is designed to securely store password entries in a local database, provide a graphical user interface, protect sensitive data with modern cryptographic primitives, and maintain a tamper-evident history of security-related actions.
+The application securely stores password entries in a local database, provides a graphical user interface, protects sensitive data with modern cryptographic primitives, and maintains a tamper-evident history of security-related actions.
 
-> **Current status:** Sprint 7 — Security Hardening + UX
+> **Current status:** Sprint 8 — Final Integration, Testing + Documentation
 
 ## Project Vision
 
-CryptoSafe Manager aims to provide a local-first password management application with:
+CryptoSafe Manager is a local-first password management application with:
 
 * encrypted password storage;
 * secure master-password-based key management;
@@ -18,10 +18,9 @@ CryptoSafe Manager aims to provide a local-first password management application
 * tamper-evident audit logging;
 * encrypted import/export and secure sharing;
 * memory protection and panic mode;
-* backup and recovery;
 * automated security testing.
 
-Real cryptographic mechanisms are introduced incrementally according to the project sprint plan.
+Real cryptographic mechanisms were introduced incrementally across eight sprints.
 
 ## Architecture
 
@@ -66,12 +65,6 @@ cryptosafe-manager/
 │   │   ├── audit/
 │   │   ├── import_export/
 │   │   ├── security/
-│   │   │   ├── activity_monitor.py
-│   │   │   ├── memory_guard.py
-│   │   │   ├── panic_mode.py
-│   │   │   ├── security_profiles.py
-│   │   │   ├── side_channel_protection.py
-│   │   │   └── tray_icon.py
 │   │   ├── audit_logger.py
 │   │   ├── config.py
 │   │   ├── events.py
@@ -102,7 +95,14 @@ cryptosafe-manager/
 │       └── sharing_dialog.py
 │
 ├── tests/
+│   └── report/
 │
+├── docs/
+│   ├── user_guide.md
+│   └── technical.md
+│
+├── run.py
+├── CryptoSafeManager.spec
 ├── requirements.txt
 ├── pytest.ini
 ├── .gitignore
@@ -111,9 +111,9 @@ cryptosafe-manager/
 
 ## Database
 
-The application currently uses SQLite.
+The application uses SQLite.
 
-The schema (version 6) contains:
+Schema version 6 contains:
 
 * `vault_entries` — password-manager entries, each stored as a single
   opaque blob (`encrypted_data`) with a UUID primary key;
@@ -128,13 +128,13 @@ The schema (version 6) contains:
 * `key_store` — master-password authentication hash, PBKDF2 salt,
   audit salt, and versioned KDF parameters.
 
-Database schema versioning is implemented using SQLite `PRAGMA user_version`. Migrations run automatically on startup.
+Schema versioning uses SQLite `PRAGMA user_version`. Migrations run automatically on startup.
 
 ## Security Model
 
 ### Master password
 
-* The master password itself is **never stored**.
+* The master password is **never stored**.
 * An Argon2id hash of the password is stored in `key_store` for verification.
 * A PBKDF2-HMAC-SHA256 key is derived from the password and a unique
   16-byte salt to obtain the master key material.
@@ -165,10 +165,9 @@ Three independent subkeys are derived from the master key material via
 
 * Hash chain: each entry stores the SHA-256 hash of the previous entry's
   plaintext JSON payload; the genesis entry uses 64 zero characters.
-* Every entry is signed with **Ed25519** using a key derived via HKDF
-  (context `cryptosafe-audit-signing`).
+* Every entry is signed with **Ed25519** using an HKDF-derived key.
 * Entry payloads are **AES-256-GCM encrypted at rest** with a separate
-  HKDF-derived key (context `cryptosafe-audit-enc`).
+  HKDF-derived key.
 * Automatic verification on every successful login; manual verification
   available in the viewer.
 * The log is **append-only**; sensitive fields are sanitized before
@@ -176,71 +175,46 @@ Three independent subkeys are derived from the master key material via
 
 ### Import/Export & Sharing
 
-* **Exports** support two encryption modes:
-  * **Password-based:** PBKDF2-HMAC-SHA256 (100,000 iterations) + AES-256-GCM,
-    with a fresh random salt and nonce per export.
-  * **Public-key:** hybrid encryption — RSA-2048-OAEP or ECIES-style
-    ephemeral ECDH P-256, both wrapping an AES-256-GCM payload.
+* **Exports** support password-based (PBKDF2 + AES-256-GCM) and
+  public-key (RSA-2048-OAEP or ECIES P-256 + AES-256-GCM) encryption.
 * **Plaintext exports** are allowed only for CSV migration.
-* Every export carries an **integrity hash** (SHA-256 of the plaintext)
-  and an **Ed25519 signature** for provenance.
-* **Imports** validate format, verify the integrity hash, and pass every
-  entry through an **anti-malware filter**.
-* **Sharing** produces a single-entry package encrypted with a
-  password or the recipient's public key.
-* **QR codes** encode share packages in chunks with a per-chunk
-  checksum, a nonce to prevent replay, and a 5-minute validity window.
+* Every export carries an **integrity hash** and an **Ed25519 signature**.
+* **Imports** validate format, verify integrity, and pass every entry
+  through an **anti-malware filter**.
+* **Sharing** produces single-entry packages with permissions and
+  expiration metadata.
+* **QR codes** encode share packages in chunks with per-chunk checksums,
+  nonce-based replay protection, and a 5-minute validity window.
 
 ### Clipboard
 
-* All clipboard content is written **plaintext** to the system clipboard.
+* Clipboard content is written **plaintext** to the system clipboard.
 * Protection relies on **auto-clear** and explicit user actions.
 * Auto-clear is **configurable** (5 s – 5 min, default 30 s, or never).
 * The clipboard is cleared on timer expiry, manual clear, lock, close,
   or new content replacement.
-* A background monitor detects **content changes** made outside the
-  application and drops ownership accordingly.
+* A background monitor detects external content changes and drops
+  ownership accordingly.
 
-### Sprint 7 — Security hardening
+### Security hardening
 
-* **Constant-time primitives** (`side_channel_protection.py`):
-  * `constant_time_compare` wraps `secrets.compare_digest` for byte
-    and string comparison in security-critical paths;
-  * `constant_time_select` for branch-free small selections;
-  * secure randomness helpers built on `secrets`.
-
-* **Secure memory management** (`memory_guard.py`):
-  * best-effort `mlock` (Unix) / `VirtualLock` (Windows) to prevent
-    swapping sensitive buffers to disk;
-  * explicit zeroing via `ctypes.memset` on free;
-  * `SecretHolder` copies bytes into a locked buffer and wipes the
-    original if it was mutable.
-
+* **Constant-time primitives** (`side_channel_protection.py`) for
+  security-critical comparisons.
+* **Secure memory management** (`memory_guard.py`): best-effort
+  `mlock` / `VirtualLock`, explicit zeroing, `SecretHolder`.
 * **Activity monitoring and auto-lock** (`activity_monitor.py`):
-  * tracks application-level activity (mouse, keyboard, focus);
-  * on Windows, also uses `GetLastInputInfo` for system-wide idle time;
-  * fires a lock callback when the configured timeout is exceeded;
-  * timeout configurable (1 minute to 8 hours, default 5 minutes).
-
-* **Panic mode** (`panic_mode.py`):
-  * hotkey `Ctrl+Shift+Q` and tray menu entry;
-  * registered handlers run in order: lock vault, wipe memory,
-    clear clipboard, hide windows;
-  * optional stealth mode shows a fake error message;
-  * logs a `panic_activated` event to the audit log.
-
+  application-level activity plus Windows `GetLastInputInfo`.
+* **Panic mode** (`panic_mode.py`): hotkey `Ctrl+Shift+Q` and tray menu;
+  runs registered handlers in order (lock, wipe, clear, hide); optional
+  stealth; logs `panic_activated`.
 * **Security profiles** (`security_profiles.py`):
-  * *Standard*: 5-minute auto-lock, 30-second clipboard.
-  * *Enhanced*: 2-minute auto-lock, 15-second clipboard, starts to tray.
-  * *Paranoid*: 1-minute auto-lock, 5-second clipboard, stealth panic.
+  * *Standard* — 5-minute auto-lock, 30-second clipboard.
+  * *Enhanced* — 2-minute auto-lock, 15-second clipboard, tray.
+  * *Paranoid* — 1-minute auto-lock, 5-second clipboard, stealth panic.
+* **System tray** (`tray_icon.py`) with lock state, quick actions, and
+  notifications.
 
-* **System tray** (`tray_icon.py`):
-  * icon color reflects lock state (red locked, green unlocked);
-  * menu with Show / Lock / Clear Clipboard / Panic / Settings / Exit;
-  * notifications for security events;
-  * all callbacks dispatched to the Tk main thread.
-
-Argon2id parameters (configurable in `src/core/config.py`):
+Argon2id parameters:
 
 * time cost: 3 iterations
 * memory cost: 64 MiB
@@ -256,13 +230,13 @@ PBKDF2 parameters:
 ## Vault Features
 
 * **CRUD:** create, read, update, and delete entries from the GUI.
-* **Soft delete:** deleted entries are moved to `deleted_entries` with a
-  30-day expiration before permanent removal.
+* **Soft delete:** deleted entries go to `deleted_entries` with a 30-day
+  expiration before permanent removal.
 * **Password generator:** CSPRNG-based (`secrets`), configurable length
   and character sets, one-per-set guarantees, optional ambiguous-character
-  exclusion, and a rolling 20-entry history to prevent recent duplicates.
+  exclusion, rolling 20-entry history.
 * **Search:** in-memory full-text search across title, username, URL,
-  notes, category, and tags. Field-specific filters and optional fuzzy
+  notes, category, and tags; field-specific filters and optional fuzzy
   matching.
 * **Table:** multi-select, sortable columns, context menu, global
   username toggle.
@@ -270,10 +244,9 @@ PBKDF2 parameters:
 ## Clipboard Features
 
 * **Copy Password / Username / All** from toolbar, menu, or context menu.
-* **Auto-clear** with a live countdown in the status bar.
+* **Auto-clear** with live countdown in the status bar.
 * **Warning** shown a few seconds before the automatic clear.
-* **Clear Clipboard** action available in the toolbar, menu, and context
-  menu.
+* **Clear Clipboard** in toolbar, menu, and context menu.
 * **Preset profiles**: *Standard*, *Secure*, *Public Computer*.
 * **Platform adapters**: Windows (`win32clipboard`) and generic
   (`pyperclip`).
@@ -292,11 +265,9 @@ PBKDF2 parameters:
 * **Export formats:** CryptoSafe native JSON, CSV, Bitwarden JSON,
   LastPass CSV.
 * **Export options:** whole vault or selected entries, include/exclude
-  individual fields, password / public-key / plaintext encryption,
-  optional GZIP compression.
-* **Import:** format auto-detection, merge / replace / dry-run modes,
-  duplicate skipping, anti-malware sanitization, file size and time
-  limits.
+  fields, password / public-key / plaintext encryption, optional GZIP.
+* **Import:** format auto-detection, merge / replace / dry-run, duplicate
+  skipping, anti-malware sanitization, size and timeout limits.
 * **Sharing:** password-protected or public-key encrypted single-entry
   packages with permissions and expiration metadata.
 * **QR codes:** chunked generation, per-chunk checksum, nonce-based
@@ -304,18 +275,14 @@ PBKDF2 parameters:
 
 ## Security Hardening Features
 
-* **Constant-time comparison** for security-critical byte/string
-  equality.
-* **Best-effort memory locking** (`mlock` / `VirtualLock`) with explicit
-  zeroing of sensitive buffers.
-* **Auto-lock** based on application and system inactivity, with
-  configurable timeouts.
-* **Panic mode** triggered by hotkey or tray, immediately locking the
-  vault and clearing sensitive state.
-* **Security profiles** that bundle timeouts, memory locking, and panic
+* Constant-time comparison for security-critical equality.
+* Best-effort memory locking (`mlock` / `VirtualLock`) with explicit
+  zeroing.
+* Auto-lock based on application and system inactivity.
+* Panic mode via hotkey or tray.
+* Security profiles that bundle timeouts, memory locking, and panic
   behaviour.
-* **System tray integration** with quick lock / unlock, panic, and
-  status indication.
+* System tray integration with lock state and quick actions.
 
 ## Setup
 
@@ -345,15 +312,65 @@ Install dependencies:
 python -m pip install -r requirements.txt
 ```
 
-## Run the Application
+## Run from Source
 
 From the project root:
+
+```powershell
+python run.py
+```
+
+or, equivalently:
 
 ```powershell
 python -m src.gui.main_window
 ```
 
-On first run, a setup wizard will ask for a master password. On subsequent runs, a login dialog will request the same password to unlock the vault.
+On first run, a setup wizard asks for a master password. On subsequent
+runs, a login dialog requests the same password to unlock the vault.
+
+## Build the Executable
+
+A PyInstaller spec is provided. From the project root:
+
+```powershell
+pyinstaller --clean --noconfirm CryptoSafeManager.spec
+```
+
+Output:
+
+```text
+dist/CryptoSafeManager/CryptoSafeManager.exe
+```
+
+The database is created next to the executable, in
+`dist/CryptoSafeManager/data/cryptosafe.db`.
+
+## Run Tests
+
+Run the complete test suite:
+
+```powershell
+python -m pytest -v
+```
+
+Coverage:
+
+```powershell
+python -m pytest --cov=src --cov-report=term-missing
+```
+
+Generate an HTML coverage report into `tests/report/htmlcov/`:
+
+```powershell
+python -m pytest --cov=src --cov-report=html:tests/report/htmlcov --cov-report=term-missing -v 2>&1 | Tee-Object -FilePath tests/report/pytest_output.txt
+```
+
+The test suite currently contains over 700 tests covering crypto, key
+management, vault CRUD, search, password generation, clipboard
+behaviour, audit signing and verification, log export, import/export
+round-trips, sharing, QR generation and decoding, security primitives,
+auto-lock, panic mode, and GUI smoke tests. Overall coverage is 80%.
 
 ### Keyboard shortcuts
 
@@ -369,19 +386,14 @@ On first run, a setup wizard will ask for a master password. On subsequent runs,
 * `Ctrl+Shift+C` — clear the clipboard
 * `Ctrl+Shift+Q` — activate panic mode
 
-## Run Tests
+## Documentation
 
-Run the complete test suite:
+Additional documentation lives under `docs/`:
 
-```powershell
-python -m pytest -v
-```
-
-The current test suite covers crypto, key management, vault CRUD,
-search, password generation, clipboard behaviour, audit signing and
-verification, log export, import/export round-trips, sharing, QR
-generation and decoding, security primitives, auto-lock, panic mode,
-and GUI smoke tests.
+* `docs/user_guide.md` — end-user guide (installation, first run,
+  daily usage, import/export, sharing, clipboard, panic mode).
+* `docs/technical.md` — architecture, cryptographic design, database
+  schema, and implementation notes.
 
 ## Sprint Roadmap
 
@@ -399,65 +411,81 @@ and GUI smoke tests.
 
 ### Sprint 7 — Hardening + UX (done)
 
-* constant-time comparison primitives;
-* secure memory handling with best-effort mlock/VirtualLock;
-* automatic locking with inactivity detection;
-* panic mode with hotkey, tray, and audit logging;
-* security profiles (Standard, Enhanced, Paranoid);
-* system tray integration with lock state and quick actions;
-* security settings dialog and profile persistence.
+### Sprint 8 — Final Integration, Testing + Documentation (done)
 
-### Sprint 8 — Integration, Testing + Documentation
-
-* complete integration testing;
-* expanded pytest coverage;
-* backup and restore;
-* PyInstaller packaging;
-* CI/CD;
-* final documentation;
-* user guide;
-* recovery procedures;
-* demonstration build.
+* all modules from Sprints 1-7 integrated and tested together;
+* test suite expanded and verified at 80% overall coverage;
+* HTML coverage report generated into `tests/report/`;
+* PyInstaller packaging with a reproducible spec file
+  (`CryptoSafeManager.spec`);
+* `run.py` entry point for running from source;
+* database path resolution updated to work in frozen bundles;
+* README finalised with setup, usage, packaging, and testing
+  instructions.
 
 ## Security Development Model
 
-Cryptographic functionality is introduced progressively.
+Cryptographic functionality was introduced progressively:
 
-Sprint 1 introduced intentionally insecure placeholders where required by the architecture. Sprint 2 introduced the real master-password and key derivation layer. Sprint 3 replaced the placeholder entry encryption with real AES-256-GCM. Sprint 4 added secure clipboard handling with auto-clear and monitoring. Sprint 5 made the audit log tamper-evident with Ed25519 signatures, a SHA-256 hash chain, and per-entry AES-GCM encryption at rest. Sprint 6 introduced encrypted import/export, secure sharing, and QR-code key exchange. Sprint 7 added side-channel and memory hardening, auto-lock, panic mode, security profiles, and system tray integration.
+* **Sprint 1** — architecture, SQLite schema, placeholder encryption.
+* **Sprint 2** — Argon2id hashing, PBKDF2 key derivation, key cache,
+  authentication, password rotation.
+* **Sprint 3** — AES-256-GCM per-entry encryption, vault CRUD, secure
+  password generator, search.
+* **Sprint 4** — secure clipboard with auto-clear, monitor, presets.
+* **Sprint 5** — tamper-evident audit log with hash chain, Ed25519
+  signatures, and per-entry AES-GCM at rest.
+* **Sprint 6** — encrypted import/export, secure sharing, QR key
+  exchange.
+* **Sprint 7** — side-channel and memory hardening, auto-lock, panic
+  mode, security profiles, system tray.
+* **Sprint 8** — integration, testing, packaging, documentation.
 
-The final application uses established cryptographic primitives from maintained libraries rather than custom cryptographic algorithms.
+The final application uses established cryptographic primitives from
+maintained libraries rather than custom cryptographic algorithms.
+
+## Known Limitations
+
+* The executable is built for the developer's own OS (Windows) only.
+* Backup/restore is still a stub; only the audit log can be exported.
+* No network features: sharing uses local files or QR codes.
+* macOS and Linux platform-specific hardening (Keychain Services,
+  kernel keyring, Touch ID) is out of scope.
+* QR decoding depends on `pyzbar` and the system `zbar` library.
 
 ## Development Status
 
-| Component              | S1          | S2                | S3                | S4                | S5                | S6                | S7                |
-| ---------------------- | ----------- | ----------------- | ----------------- | ----------------- | ----------------- | ----------------- | ----------------- |
-| SQLite database        | Implemented | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
-| Migration system       | Basic       | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
-| GUI shell              | Implemented | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
-| Settings               | Implemented | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
-| Event bus              | Implemented | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
-| Key manager            | Stub        | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
-| Backup/restore         | Stub        | Stub              | Stub              | Stub              | Stub              | Stub              | Stub              |
-| Master password        | Planned     | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
-| Argon2id hashing       | Planned     | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
-| PBKDF2 key derivation  | Planned     | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
-| HKDF key separation    | Planned     | Planned (S5)      | Planned (S5)      | Planned (S5)      | Implemented       | Implemented       | Implemented       |
-| AES-256-GCM (vault)    | Planned     | Planned (S3)      | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
-| Vault CRUD             | Planned     | Planned (S3)      | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
-| Search / filter        | Planned     | Planned (S3)      | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
-| Secure clipboard       | Planned     | Planned (S4)      | Planned (S4)      | Implemented       | Implemented       | Implemented       | Implemented       |
-| Signed audit log       | Planned     | Planned (S5)      | Planned (S5)      | Planned (S5)      | Implemented       | Implemented       | Implemented       |
-| Import / export        | Planned     | Planned (S6)      | Planned (S6)      | Planned (S6)      | Planned (S6)      | Implemented       | Implemented       |
-| Secure sharing         | Planned     | Planned (S6)      | Planned (S6)      | Planned (S6)      | Planned (S6)      | Implemented       | Implemented       |
-| QR key exchange        | Planned     | Planned (S6)      | Planned (S6)      | Planned (S6)      | Planned (S6)      | Implemented       | Implemented       |
-| Constant-time prims    | Planned     | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (S7)      | Implemented       |
-| Secure memory          | Planned     | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (S7)      | Implemented       |
-| Auto-lock              | Planned     | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (S7)      | Implemented       |
-| Panic mode             | Planned     | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (S7)      | Implemented       |
-| Security profiles      | Planned     | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (S7)      | Implemented       |
-| System tray            | Planned     | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (S7)      | Implemented       |
-| OS keychain            | Planned     | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (Sprint 8)|
-| Packaging              | Planned     | Planned (S8)      | Planned (S8)      | Planned (S8)      | Planned (S8)      | Planned (S8)      | Planned (Sprint 8)|
+| Component              | Sprint 8    |
+| ---------------------- | ----------- |
+| SQLite database        | Implemented |
+| Migration system       | Implemented |
+| GUI shell              | Implemented |
+| Settings               | Implemented |
+| Event bus              | Implemented |
+| Key manager            | Implemented |
+| Master password        | Implemented |
+| Argon2id hashing       | Implemented |
+| PBKDF2 key derivation  | Implemented |
+| HKDF key separation    | Implemented |
+| AES-256-GCM (vault)    | Implemented |
+| Vault CRUD             | Implemented |
+| Search / filter        | Implemented |
+| Secure clipboard       | Implemented |
+| Signed audit log       | Implemented |
+| Import / export        | Implemented |
+| Secure sharing         | Implemented |
+| QR key exchange        | Implemented |
+| Constant-time prims    | Implemented |
+| Secure memory          | Implemented |
+| Auto-lock              | Implemented |
+| Panic mode             | Implemented |
+| Security profiles      | Implemented |
+| System tray            | Implemented |
+| Test suite             | 700+ tests  |
+| Test coverage          | 80%         |
+| PyInstaller build      | Implemented |
+| Backup/restore         | Stub        |
+| OS keychain            | Planned     |
 
 ## License
 
