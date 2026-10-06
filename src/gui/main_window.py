@@ -1,19 +1,11 @@
 """
 Main application window.
-
-Responsible for:
-  * initializing core services (Database, EventBus, KeyManager,
-    AuditLogger, EntryManager, ClipboardService);
-  * running the first-run SetupWizard or the LoginDialog at startup;
-  * hosting the main menu, vault table, search bar, and status bar;
-  * handling CRUD (Add/Edit/Delete), search, clipboard operations,
-    Lock, Change Password, Audit Log, and Exit actions.
 """
 
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 from src.core import config
 from src.core.audit.audit_logger import AuditLogger
@@ -32,6 +24,10 @@ from src.core.events import (
     UserLoggedIn,
     UserLoggedOut,
 )
+from src.core.import_export.exporter import VaultExporter
+from src.core.import_export.importer import VaultImporter
+from src.core.import_export.qr_service import QRService
+from src.core.import_export.sharing_service import SharingService
 from src.core.key_manager import KeyManager
 from src.core.settings_manager import SettingsManager
 from src.core.vault.entry_manager import EntryManager, VaultError
@@ -40,9 +36,14 @@ from src.database.db import Database
 from src.gui.audit_log_viewer import AuditLogViewer
 from src.gui.clipboard_settings_dialog import ClipboardSettingsDialog
 from src.gui.entry_dialog import EntryDialog
+from src.gui.export_dialog import ExportDialog
+from src.gui.import_dialog import ImportDialog
 from src.gui.login_dialog import LoginDialog
+from src.gui.open_share_dialog import OpenShareDialog
+from src.gui.qr_viewer import QRViewer
 from src.gui.settings_dialog import SettingsDialog
 from src.gui.setup_wizard import SetupWizard
+from src.gui.sharing_dialog import SharingDialog
 
 
 # --------------------------------------------------------------------- #
@@ -95,6 +96,22 @@ class MainWindow(tk.Tk):
             event_bus=self.event_bus,
         )
 
+        self.exporter = VaultExporter(
+            self.entry_manager,
+            self.key_manager,
+            audit_logger=self.audit_logger,
+        )
+        self.importer = VaultImporter(
+            self.entry_manager,
+            self.key_manager,
+            audit_logger=self.audit_logger,
+        )
+        self.sharing_service = SharingService(
+            self.entry_manager,
+            self.key_manager,
+            audit_logger=self.audit_logger,
+        )
+
         self._clipboard_settings = load_clipboard_settings(self.settings_manager)
         self.clipboard_service = ClipboardService(
             self.event_bus,
@@ -128,6 +145,9 @@ class MainWindow(tk.Tk):
         self.bind("<Control-f>", lambda _e: self._focus_search())
         self.bind("<Control-Shift-C>", lambda _e: self._clear_clipboard())
         self.bind("<Control-l>", lambda _e: self._open_audit_log())
+        self.bind("<Control-i>", lambda _e: self._open_import())
+        self.bind("<Control-Shift-E>", lambda _e: self._open_export())
+        self.bind("<Control-Shift-O>", lambda _e: self._open_share())
 
         self._schedule_clipboard_status_refresh()
         self.after(100, self._run_auth_gate)
@@ -170,7 +190,6 @@ class MainWindow(tk.Tk):
         self._refresh_entries()
 
     def _verify_integrity_on_startup(self) -> None:
-        """VER-1: verify audit log integrity on every successful login."""
         try:
             report = self.log_verifier.verify_all()
         except Exception:
@@ -245,6 +264,19 @@ class MainWindow(tk.Tk):
         file_menu.add_command(label="Open", command=self._not_implemented)
         file_menu.add_command(label="Backup", command=self._not_implemented)
         file_menu.add_separator()
+        file_menu.add_command(
+            label="Export Vault…",
+            command=self._open_export,
+        )
+        file_menu.add_command(
+            label="Import Vault…",
+            command=self._open_import,
+        )
+        file_menu.add_command(
+            label="Open Share…",
+            command=self._open_share,
+        )
+        file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._shutdown)
 
         edit_menu = tk.Menu(menu_bar, tearoff=False)
@@ -263,6 +295,15 @@ class MainWindow(tk.Tk):
         edit_menu.add_command(
             label="Clear Clipboard",
             command=self._clear_clipboard,
+        )
+        edit_menu.add_separator()
+        edit_menu.add_command(
+            label="Share Entry…",
+            command=self._share_selected,
+        )
+        edit_menu.add_command(
+            label="Show QR…",
+            command=self._show_qr_selected,
         )
 
         view_menu = tk.Menu(menu_bar, tearoff=False)
@@ -310,9 +351,8 @@ class MainWindow(tk.Tk):
         self.config(menu=menu_bar)
 
     # ------------------------------------------------------------------ #
-    # Toolbar / search / table / context / status
+    # Toolbar
     # ------------------------------------------------------------------ #
-    # (unchanged from Sprint 4 except for new "Logs" button)
 
     def _create_toolbar(self) -> None:
         toolbar = ttk.Frame(self, padding=(10, 6))
@@ -334,7 +374,24 @@ class MainWindow(tk.Tk):
             toolbar, text="Copy Password", command=self._copy_password_selected
         ).pack(side=tk.LEFT)
         ttk.Button(
-            toolbar, text="Clear Clipboard", command=self._clear_clipboard
+            toolbar, text="Share…", command=self._share_selected
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(
+            toolbar, text="Show QR…", command=self._show_qr_selected
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(
+            side=tk.LEFT, fill=tk.Y, padx=10
+        )
+
+        ttk.Button(
+            toolbar, text="Import…", command=self._open_import
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            toolbar, text="Export…", command=self._open_export
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(
+            toolbar, text="Open Share…", command=self._open_share
         ).pack(side=tk.LEFT, padx=(6, 0))
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(
@@ -347,6 +404,10 @@ class MainWindow(tk.Tk):
         ttk.Button(
             toolbar, text="Refresh", command=self._refresh_entries
         ).pack(side=tk.LEFT, padx=(6, 0))
+
+    # ------------------------------------------------------------------ #
+    # Search bar
+    # ------------------------------------------------------------------ #
 
     def _create_search_bar(self) -> None:
         bar = ttk.Frame(self, padding=(10, 0))
@@ -373,6 +434,10 @@ class MainWindow(tk.Tk):
             text="Clear",
             command=lambda: self.search_var.set(""),
         ).pack(side=tk.LEFT, padx=(6, 0))
+
+    # ------------------------------------------------------------------ #
+    # Main content
+    # ------------------------------------------------------------------ #
 
     def _create_main_content(self) -> None:
         frame = ttk.Frame(self, padding=10)
@@ -417,6 +482,13 @@ class MainWindow(tk.Tk):
         )
         self.context_menu.add_separator()
         self.context_menu.add_command(
+            label="Share Entry…", command=self._share_selected
+        )
+        self.context_menu.add_command(
+            label="Show QR…", command=self._show_qr_selected
+        )
+        self.context_menu.add_separator()
+        self.context_menu.add_command(
             label="Clear Clipboard", command=self._clear_clipboard
         )
         self.context_menu.add_separator()
@@ -432,6 +504,10 @@ class MainWindow(tk.Tk):
                 self.context_menu.tk_popup(event.x_root, event.y_root)
             finally:
                 self.context_menu.grab_release()
+
+    # ------------------------------------------------------------------ #
+    # Status bar
+    # ------------------------------------------------------------------ #
 
     def _create_status_bar(self) -> None:
         self.status_bar = ttk.Frame(self, relief=tk.SUNKEN)
@@ -483,7 +559,7 @@ class MainWindow(tk.Tk):
         )
 
     # ------------------------------------------------------------------ #
-    # Entry loading & filtering (unchanged)
+    # Entry loading & filtering
     # ------------------------------------------------------------------ #
 
     def _refresh_entries(self) -> None:
@@ -572,7 +648,7 @@ class MainWindow(tk.Tk):
         return True
 
     # ------------------------------------------------------------------ #
-    # CRUD (unchanged)
+    # CRUD
     # ------------------------------------------------------------------ #
 
     def _add_entry(self) -> None:
@@ -627,7 +703,7 @@ class MainWindow(tk.Tk):
         self._refresh_entries()
 
     # ------------------------------------------------------------------ #
-    # Clipboard (unchanged)
+    # Clipboard
     # ------------------------------------------------------------------ #
 
     def _copy_password_selected(self) -> None:
@@ -684,6 +760,95 @@ class MainWindow(tk.Tk):
             )
         except Exception:
             pass
+
+    # ------------------------------------------------------------------ #
+    # Import / Export / Share
+    # ------------------------------------------------------------------ #
+
+    def _open_export(self) -> None:
+        if not self._require_unlocked():
+            return
+        dialog = ExportDialog(
+            self,
+            exporter=self.exporter,
+            selected_entry_ids=self._selected_ids(),
+        )
+        self.wait_window(dialog)
+        if dialog.result:
+            messagebox.showinfo(
+                "Export complete",
+                "Export finished successfully.",
+                parent=self,
+            )
+
+    def _open_import(self) -> None:
+        if not self._require_unlocked():
+            return
+        dialog = ImportDialog(self, importer=self.importer)
+        self.wait_window(dialog)
+        if dialog.result is not None:
+            self._refresh_entries()
+
+    def _open_share(self) -> None:
+        if not self._require_unlocked():
+            return
+        dialog = OpenShareDialog(self, self.sharing_service)
+        self.wait_window(dialog)
+        if dialog.result:
+            self._refresh_entries()
+
+    def _share_selected(self) -> None:
+        if not self._require_unlocked():
+            return
+        entry = self._selected_entry()
+        if entry is None:
+            messagebox.showinfo(
+                "No selection",
+                "Select an entry first.",
+                parent=self,
+            )
+            return
+        dialog = SharingDialog(self, self.sharing_service, entry["id"])
+        self.wait_window(dialog)
+        if dialog.result:
+            messagebox.showinfo(
+                "Share created",
+                f"Share ID: {dialog.result}",
+                parent=self,
+            )
+
+    def _show_qr_selected(self) -> None:
+        if not self._require_unlocked():
+            return
+        entry = self._selected_entry()
+        if entry is None:
+            messagebox.showinfo(
+                "No selection",
+                "Select an entry first.",
+                parent=self,
+            )
+            return
+
+        password = simpledialog.askstring(
+            "Share QR password",
+            "Password to protect the QR share package:",
+            show="*",
+            parent=self,
+        )
+        if not password:
+            return
+
+        try:
+            pkg = self.sharing_service.create_share(
+                entry["id"],
+                recipient="",
+                password=password,
+            )
+        except Exception as exc:
+            messagebox.showerror("QR share failed", str(exc), parent=self)
+            return
+
+        QRViewer(self, pkg.package_bytes, title=f"Share: {entry.get('title', '')}")
 
     # ------------------------------------------------------------------ #
     # Toggles & focus
@@ -745,7 +910,7 @@ class MainWindow(tk.Tk):
             "About CryptoSafe Manager",
             "CryptoSafe Manager\n"
             "Secure local password manager\n"
-            "Sprint 5 development build",
+            "Sprint 6 development build",
         )
 
     # ------------------------------------------------------------------ #

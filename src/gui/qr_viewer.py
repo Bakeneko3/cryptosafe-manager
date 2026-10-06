@@ -1,12 +1,10 @@
 """
 QR code viewer.
-
-Generates one or more QR codes for a given payload, displays them as
-inline PNG images with navigation, and offers copy/save actions.
 """
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -17,10 +15,11 @@ from src.core.import_export.qr_service import (
 )
 
 
+MAX_QR_DISPLAY_PX = 500
+
+
 class QRViewer(tk.Toplevel):
-    """
-    Simple modal viewer for one or more QR codes.
-    """
+    """Simple modal viewer for one or more QR codes."""
 
     def __init__(self, master, payload: bytes, title: str = "QR Code") -> None:
         super().__init__(master)
@@ -34,14 +33,20 @@ class QRViewer(tk.Toplevel):
         self._current = 0
         self._chunks: list = []
         self._photo = None
+        self._pil_image = None
 
         self._create_widgets()
         self._generate()
+        self._center_on_screen()
 
         self.transient(master)
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.bind("<Escape>", lambda _e: self.destroy())
+
+    # ------------------------------------------------------------------ #
+    # UI
+    # ------------------------------------------------------------------ #
 
     def _create_widgets(self) -> None:
         c = ttk.Frame(self, padding=16)
@@ -67,6 +72,20 @@ class QRViewer(tk.Toplevel):
             nav, text="Close", command=self.destroy
         ).pack(side=tk.RIGHT, padx=(0, 6))
 
+    def _center_on_screen(self) -> None:
+        self.update_idletasks()
+        w = self.winfo_width()
+        h = self.winfo_height()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
+        self.geometry(f"+{x}+{y}")
+
+    # ------------------------------------------------------------------ #
+    # Generate / render
+    # ------------------------------------------------------------------ #
+
     def _generate(self) -> None:
         try:
             self._chunks = self.service.generate(self.payload)
@@ -85,8 +104,15 @@ class QRViewer(tk.Toplevel):
         chunk = self._chunks[self._current]
 
         from PIL import Image, ImageTk
-        import io
+
         img = Image.open(io.BytesIO(chunk.png_bytes))
+
+        # Downscale to fit the screen.
+        img.thumbnail(
+            (MAX_QR_DISPLAY_PX, MAX_QR_DISPLAY_PX),
+            Image.LANCZOS,
+        )
+        self._pil_image = img
         self._photo = ImageTk.PhotoImage(img)
         self.image_label.configure(image=self._photo)
 
@@ -98,7 +124,11 @@ class QRViewer(tk.Toplevel):
         )
 
         state_prev = tk.NORMAL if self._current > 0 else tk.DISABLED
-        state_next = tk.NORMAL if self._current < len(self._chunks) - 1 else tk.DISABLED
+        state_next = (
+            tk.NORMAL
+            if self._current < len(self._chunks) - 1
+            else tk.DISABLED
+        )
         self.prev_btn.configure(state=state_prev)
         self.next_btn.configure(state=state_next)
 
