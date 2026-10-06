@@ -5,7 +5,7 @@ from threading import RLock
 from typing import Callable, Iterator
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class Database:
@@ -18,7 +18,7 @@ class Database:
         self._connection = sqlite3.connect(
             self.db_path,
             check_same_thread=False,
-            isolation_level=None,   # we manage transactions explicitly
+            isolation_level=None,
         )
 
         self._connection.row_factory = sqlite3.Row
@@ -127,7 +127,7 @@ class Database:
                 expires_at TEXT,
                 FOREIGN KEY (original_entry_id)
                     REFERENCES vault_entries(id)
-                    ON DELETE SET NULL
+                    ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS import_export_history (
@@ -392,11 +392,55 @@ class Database:
             """
         )
 
+    @staticmethod
+    def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
+        """
+        Sprint 6 fix: change shared_entries.original_entry_id FK behavior
+        from ON DELETE SET NULL to ON DELETE CASCADE. The column is
+        NOT NULL, so SET NULL would violate the constraint.
+
+        SQLite cannot ALTER a foreign key, so we rebuild the table.
+        """
+        cursor = connection.cursor()
+
+        cursor.execute("DROP INDEX IF EXISTS idx_shared_entries_original;")
+        cursor.execute("ALTER TABLE shared_entries RENAME TO shared_entries_old;")
+        cursor.execute(
+            """
+            CREATE TABLE shared_entries (
+                shared_id TEXT PRIMARY KEY,
+                original_entry_id TEXT NOT NULL,
+                encryption_method TEXT NOT NULL,
+                recipient_info TEXT,
+                permissions TEXT,
+                shared_at TEXT NOT NULL,
+                expires_at TEXT,
+                FOREIGN KEY (original_entry_id)
+                    REFERENCES vault_entries(id)
+                    ON DELETE CASCADE
+            );
+            """
+        )
+        cursor.execute(
+            """
+            INSERT INTO shared_entries
+            SELECT * FROM shared_entries_old;
+            """
+        )
+        cursor.execute("DROP TABLE shared_entries_old;")
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_shared_entries_original
+                ON shared_entries(original_entry_id);
+            """
+        )
+
     _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
         1: _migrate_v1_to_v2.__func__,
         2: _migrate_v2_to_v3.__func__,
         3: _migrate_v3_to_v4.__func__,
         4: _migrate_v4_to_v5.__func__,
+        5: _migrate_v5_to_v6.__func__,
     }
 
     # ------------------------------------------------------------------ #
@@ -425,13 +469,6 @@ class Database:
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
-        """
-        Context manager wrapping a SQLite transaction.
-
-        Supports nesting via SAVEPOINTs. The outermost transaction
-        controls the actual COMMIT / ROLLBACK; inner transactions only
-        release or roll back to their savepoint.
-        """
         with self._lock:
             depth = self._tx_depth
             savepoint_name = f"sp_{depth}"
