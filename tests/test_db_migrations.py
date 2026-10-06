@@ -551,3 +551,151 @@ def test_migration_v3_to_v4_indexes_present(tmp_path: Path) -> None:
     assert "idx_audit_log_timestamp" in names
     assert "idx_audit_log_event_type" in names
     assert "idx_audit_log_entry_id" in names
+
+
+# --------------------------------------------------------------------- #
+# v4 -> v5 migration
+# --------------------------------------------------------------------- #
+
+
+def _create_v4_database(db_path: Path) -> None:
+    """Create a v4 database with the Sprint 5 schema."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE vault_entries (
+                id TEXT PRIMARY KEY,
+                encrypted_data BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                tags TEXT
+            );
+
+            CREATE TABLE deleted_entries (
+                id TEXT PRIMARY KEY,
+                encrypted_data BLOB NOT NULL,
+                deleted_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+
+            CREATE TABLE audit_log (
+                sequence_number INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                source TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                entry_id TEXT,
+                previous_hash TEXT NOT NULL,
+                entry_data BLOB NOT NULL,
+                signature TEXT NOT NULL
+            );
+
+            CREATE TABLE audit_public_key (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                public_key TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                setting_key TEXT NOT NULL UNIQUE,
+                setting_value BLOB,
+                encrypted INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE key_store (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key_type TEXT NOT NULL,
+                key_data BLOB,
+                version INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            PRAGMA user_version = 4;
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_migration_v4_to_v5_updates_version(tmp_path: Path) -> None:
+    db_path = tmp_path / "v4.db"
+    _create_v4_database(db_path)
+    assert _get_user_version(db_path) == 4
+
+    db = Database(db_path)
+    db.close()
+    assert _get_user_version(db_path) == SCHEMA_VERSION
+
+
+def test_migration_v4_to_v5_creates_new_tables(tmp_path: Path) -> None:
+    db_path = tmp_path / "v4.db"
+    _create_v4_database(db_path)
+
+    db = Database(db_path)
+    db.close()
+
+    tables = _table_names(db_path)
+    assert "shared_entries" in tables
+    assert "import_export_history" in tables
+    assert "contacts" in tables
+
+
+def test_migration_v4_to_v5_shared_entries_schema(tmp_path: Path) -> None:
+    db_path = tmp_path / "v4.db"
+    _create_v4_database(db_path)
+
+    db = Database(db_path)
+    db.close()
+
+    cols = _table_columns(db_path, "shared_entries")
+    assert "shared_id" in cols
+    assert "original_entry_id" in cols
+    assert "encryption_method" in cols
+    assert "recipient_info" in cols
+    assert "permissions" in cols
+    assert "shared_at" in cols
+    assert "expires_at" in cols
+
+
+def test_migration_v4_to_v5_contacts_schema(tmp_path: Path) -> None:
+    db_path = tmp_path / "v4.db"
+    _create_v4_database(db_path)
+
+    db = Database(db_path)
+    db.close()
+
+    cols = _table_columns(db_path, "contacts")
+    assert "id" in cols
+    assert "name" in cols
+    assert "public_key" in cols
+    assert "fingerprint" in cols
+    assert "key_type" in cols
+
+
+def test_migration_v4_to_v5_preserves_vault_entries(tmp_path: Path) -> None:
+    db_path = tmp_path / "v4.db"
+    _create_v4_database(db_path)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO vault_entries (id, encrypted_data, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            ("test-id", b"\x00\x01\x02", "2024-01-01", "2024-01-01"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    db = Database(db_path)
+    rows = db.fetch_all("SELECT id FROM vault_entries")
+    db.close()
+
+    assert len(rows) == 1
+    assert rows[0]["id"] == "test-id"

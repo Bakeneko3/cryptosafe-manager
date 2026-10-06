@@ -5,7 +5,7 @@ from threading import Lock
 from typing import Callable, Iterator
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class Database:
@@ -118,6 +118,43 @@ class Database:
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS shared_entries (
+                shared_id TEXT PRIMARY KEY,
+                original_entry_id TEXT NOT NULL,
+                encryption_method TEXT NOT NULL,
+                recipient_info TEXT,
+                permissions TEXT,
+                shared_at TEXT NOT NULL,
+                expires_at TEXT,
+                FOREIGN KEY (original_entry_id)
+                    REFERENCES vault_entries(id)
+                    ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS import_export_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation_type TEXT NOT NULL,
+                format TEXT NOT NULL,
+                encryption TEXT,
+                entry_count INTEGER NOT NULL,
+                file_size INTEGER NOT NULL,
+                checksum TEXT,
+                verification_status TEXT,
+                timestamp TEXT NOT NULL,
+                details TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                identifier TEXT,
+                public_key TEXT,
+                fingerprint TEXT,
+                key_type TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_used_at TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_vault_entries_created_at
                 ON vault_entries(created_at);
 
@@ -138,6 +175,15 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_key_store_key_type
                 ON key_store(key_type);
+
+            CREATE INDEX IF NOT EXISTS idx_shared_entries_original
+                ON shared_entries(original_entry_id);
+
+            CREATE INDEX IF NOT EXISTS idx_import_export_history_ts
+                ON import_export_history(timestamp);
+
+            CREATE INDEX IF NOT EXISTS idx_contacts_fingerprint
+                ON contacts(fingerprint);
             """
         )
 
@@ -251,23 +297,8 @@ class Database:
 
     @staticmethod
     def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
-        """
-        Sprint 5 migration.
-
-        Replaces audit_log with a tamper-evident schema:
-            sequence_number, timestamp, event_type, severity, source,
-            user_id, entry_id, previous_hash, entry_data, signature
-
-        Adds audit_public_key table (Ed25519 public key, single row).
-
-        Existing audit_log rows are dropped: they were written by the
-        Sprint 1/2 logger without signatures or hash chain and cannot
-        be retroactively verified. The new logger creates a fresh
-        genesis entry on first use.
-        """
         cursor = connection.cursor()
 
-        # Drop old table and its indexes.
         cursor.execute("DROP INDEX IF EXISTS idx_audit_log_entry_id;")
         cursor.execute("DROP INDEX IF EXISTS idx_audit_log_timestamp;")
         cursor.execute("DROP TABLE IF EXISTS audit_log;")
@@ -310,10 +341,68 @@ class Database:
             """
         )
 
+    @staticmethod
+    def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
+        """
+        Sprint 6 migration.
+
+        Adds tables for import/export history, sharing, and contacts.
+        """
+        cursor = connection.cursor()
+
+        cursor.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS shared_entries (
+                shared_id TEXT PRIMARY KEY,
+                original_entry_id TEXT NOT NULL,
+                encryption_method TEXT NOT NULL,
+                recipient_info TEXT,
+                permissions TEXT,
+                shared_at TEXT NOT NULL,
+                expires_at TEXT,
+                FOREIGN KEY (original_entry_id)
+                    REFERENCES vault_entries(id)
+                    ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS import_export_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation_type TEXT NOT NULL,
+                format TEXT NOT NULL,
+                encryption TEXT,
+                entry_count INTEGER NOT NULL,
+                file_size INTEGER NOT NULL,
+                checksum TEXT,
+                verification_status TEXT,
+                timestamp TEXT NOT NULL,
+                details TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                identifier TEXT,
+                public_key TEXT,
+                fingerprint TEXT,
+                key_type TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_used_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_shared_entries_original
+                ON shared_entries(original_entry_id);
+            CREATE INDEX IF NOT EXISTS idx_import_export_history_ts
+                ON import_export_history(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_contacts_fingerprint
+                ON contacts(fingerprint);
+            """
+        )
+
     _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
         1: _migrate_v1_to_v2.__func__,
         2: _migrate_v2_to_v3.__func__,
         3: _migrate_v3_to_v4.__func__,
+        4: _migrate_v4_to_v5.__func__,
     }
 
     # ------------------------------------------------------------------ #
