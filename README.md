@@ -4,7 +4,7 @@ CryptoSafe Manager is a cross-platform desktop password manager developed as an 
 
 The application is designed to securely store password entries in a local database, provide a graphical user interface, protect sensitive data with modern cryptographic primitives, and maintain a tamper-evident history of security-related actions.
 
-> **Current status:** Sprint 5 — Audit Logs + Integrity
+> **Current status:** Sprint 6 — Encrypted Import/Export + Secure Sharing
 
 ## Project Vision
 
@@ -16,7 +16,7 @@ CryptoSafe Manager aims to provide a local-first password management application
 * secure clipboard handling;
 * automatic locking;
 * tamper-evident audit logging;
-* encrypted import/export;
+* encrypted import/export and secure sharing;
 * backup and recovery;
 * automated security testing.
 
@@ -38,7 +38,8 @@ The project follows an MVC-like separation of responsibilities:
 │          Core Layer         │
 │       src/core/             │
 │ Crypto / Vault / Clipboard /│
-│ Audit / Events / Settings   │
+│ Audit / ImportExport /      │
+│ Events / Settings           │
 └──────────────┬──────────────┘
                │
                ▼
@@ -79,6 +80,13 @@ cryptosafe-manager/
 │   │   │   ├── log_signer.py
 │   │   │   ├── log_verifier.py
 │   │   │   └── log_formatters.py
+│   │   ├── import_export/
+│   │   │   ├── exporter.py
+│   │   │   ├── importer.py
+│   │   │   ├── sharing_service.py
+│   │   │   ├── key_exchange.py
+│   │   │   ├── qr_service.py
+│   │   │   └── formats/
 │   │   ├── audit_logger.py
 │   │   ├── config.py
 │   │   ├── events.py
@@ -96,11 +104,16 @@ cryptosafe-manager/
 │       ├── change_password_dialog.py
 │       ├── clipboard_settings_dialog.py
 │       ├── entry_dialog.py
+│       ├── export_dialog.py
+│       ├── import_dialog.py
 │       ├── login_dialog.py
 │       ├── main_window.py
+│       ├── open_share_dialog.py
 │       ├── password_generator_dialog.py
+│       ├── qr_viewer.py
 │       ├── settings_dialog.py
-│       └── setup_wizard.py
+│       ├── setup_wizard.py
+│       └── sharing_dialog.py
 │
 ├── tests/
 │
@@ -117,15 +130,17 @@ cryptosafe-manager/
 
 The application currently uses SQLite.
 
-The schema (version 4) contains:
+The schema (version 6) contains:
 
 * `vault_entries` — password-manager entries, each stored as a single
   opaque blob (`encrypted_data`) with a UUID primary key;
 * `deleted_entries` — soft-deleted entries with an expiration timestamp;
 * `audit_log` — tamper-evident log with sequence number, hash chain,
   encrypted payload, and Ed25519 signature;
-* `audit_public_key` — single-row table holding the Ed25519 public key
-  used to verify the audit log;
+* `audit_public_key` — single-row table holding the Ed25519 public key;
+* `shared_entries` — metadata for created shares;
+* `import_export_history` — audit trail of import/export operations;
+* `contacts` — recipient records with public keys and fingerprints;
 * `settings` — application configuration;
 * `key_store` — master-password authentication hash, PBKDF2 salt,
   audit salt, and versioned KDF parameters.
@@ -163,27 +178,55 @@ Three independent subkeys are derived from the master key material via
 * The stored blob has the format `nonce (12 B) || ciphertext || tag (16 B)`.
 * The authentication tag is verified on decryption.
 
-### Audit log integrity (Sprint 5)
+### Audit log integrity
 
-* The audit log is a **hash chain**: each entry stores the SHA-256 hash
-  of the previous entry's plaintext JSON payload. The first entry uses
-  64 zero characters as the genesis hash.
+* Hash chain: each entry stores the SHA-256 hash of the previous entry's
+  plaintext JSON payload; the genesis entry uses 64 zero characters.
 * Every entry is signed with **Ed25519** using a key derived via HKDF
-  from the master key material (context `cryptosafe-audit-signing`).
-* Entry payloads are additionally **AES-256-GCM encrypted at rest**
-  using a separate HKDF-derived key (context `cryptosafe-audit-enc`).
-* The public key is stored once in `audit_public_key` and can be exported
-  for independent verification.
-* **Automatic verification** runs on every successful login (VER-1).
-  If tampering is detected, the user is notified and a `tampering_detected`
-  event is logged.
-* **Manual verification** is available in the audit log viewer.
-* The log is **append-only** by API: there are no update or delete
-  operations exposed by `AuditLogger` or `AuditExporter`.
-* Sensitive values (`password`, `encryption_key`, etc.) are **sanitized**
-  before being written — replaced with `[REDACTED]`.
+  (context `cryptosafe-audit-signing`).
+* Entry payloads are **AES-256-GCM encrypted at rest** with a separate
+  HKDF-derived key (context `cryptosafe-audit-enc`).
+* Automatic verification on every successful login; manual verification
+  available in the viewer.
+* The log is **append-only**; sensitive fields are sanitized before
+  writing.
 
-### Clipboard (Sprint 4)
+### Import/Export & Sharing (Sprint 6)
+
+* **Exports** support two encryption modes:
+  * **Password-based:** PBKDF2-HMAC-SHA256 (100,000 iterations) + AES-256-GCM,
+    with a fresh random salt and nonce per export.
+  * **Public-key:** hybrid encryption — RSA-2048-OAEP or ECIES-style
+    ephemeral ECDH P-256, both wrapping an AES-256-GCM payload.
+* **Plaintext exports** are allowed only for CSV migration.
+* Every export carries an **integrity hash** (SHA-256 of the plaintext)
+  and an **Ed25519 signature** for provenance.
+* **Imports** validate format, verify the integrity hash, and pass every
+  entry through an **anti-malware filter** (script tags, executable
+  magic bytes, shell commands). Files larger than 10 MB and operations
+  exceeding 30 seconds are rejected.
+* **Sharing** produces a single-entry package encrypted with a
+  password or the recipient's public key. Packages contain only the
+  shareable fields (title, username, password, URL, notes, category),
+  plus permissions and expiration metadata.
+* **QR codes** encode share packages in chunks with a per-chunk
+  checksum, a nonce to prevent replay, and a 5-minute validity window.
+* **No sensitive data is ever written to disk in plaintext.**
+
+Argon2id parameters (configurable in `src/core/config.py`):
+
+* time cost: 3 iterations
+* memory cost: 64 MiB
+* parallelism: 4 lanes
+* hash length: 32 bytes
+
+PBKDF2 parameters:
+
+* iterations: 100,000
+* salt length: 16 bytes
+* key length: 32 bytes (AES-256)
+
+### Clipboard
 
 * All clipboard content is written **plaintext** to the system clipboard:
   obfuscation is not possible because other applications must be able to
@@ -201,19 +244,6 @@ Three independent subkeys are derived from the master key material via
   process *read* the clipboard is not technically possible and is
   deliberately out of scope.
 * The clipboard requires the vault to be unlocked.
-
-Argon2id parameters (configurable in `src/core/config.py`):
-
-* time cost: 3 iterations
-* memory cost: 64 MiB
-* parallelism: 4 lanes
-* hash length: 32 bytes
-
-PBKDF2 parameters:
-
-* iterations: 100,000
-* salt length: 16 bytes
-* key length: 32 bytes (AES-256)
 
 ## Vault Features
 
@@ -246,27 +276,39 @@ PBKDF2 parameters:
 ## Audit Log Features
 
 * **Tamper-evident**: hash chain + Ed25519 signatures + AES-GCM at rest.
-* **Viewer** (`View → Audit Log`, `Ctrl+L`):
-  * sortable table with sequence number, timestamp, type, severity,
-    source, entry id;
-  * filters by event type and severity;
-  * full-text search across all fields;
-  * details panel showing the full decrypted payload, previous hash,
-    and signature prefix.
-* **Manual verification** (Verify button) — checks signature and chain
-  for every entry and reports errors with sequence numbers.
-* **Automatic verification** on every successful login.
-* **Export:**
-  * **Signed JSON** — full log with signatures and public key, suitable
-    for independent verification.
-  * **CSV** — flat view for spreadsheets.
-  * **PDF** — human-readable report with summary and entries table.
+* **Viewer** (`View → Audit Log`, `Ctrl+L`): sortable, filterable,
+  searchable, with details panel.
+* **Manual verification** and **automatic verification** on every login.
+* **Export** to signed JSON (independently verifiable), CSV, and PDF.
 * **Severity levels**: `INFO`, `WARN`, `ERROR`, `CRITICAL`.
-* **Event categories** (integrated via the event bus):
-  * *system* — genesis, startup, shutdown, tampering;
-  * *authentication* — login, logout;
-  * *vault* — entry created/updated/deleted;
-  * *clipboard* — copied, cleared (with reason).
+
+## Import / Export & Sharing Features
+
+* **Export formats:**
+  * CryptoSafe native JSON (encrypted);
+  * CSV (plaintext or encrypted);
+  * Bitwarden JSON (compatible);
+  * LastPass CSV (compatible).
+* **Export options:**
+  * whole vault or selected entries;
+  * include/exclude individual fields;
+  * password / public-key / plaintext encryption;
+  * optional GZIP compression.
+* **Import:**
+  * format auto-detection;
+  * merge / replace / dry-run modes;
+  * duplicate skipping;
+  * sanitization of malicious content;
+  * file size and processing time limits.
+* **Sharing:**
+  * password-protected or public-key encrypted single-entry packages;
+  * permissions and expiration metadata;
+  * recipient-side import without affecting the existing vault.
+* **QR codes:**
+  * chunked generation for large packages;
+  * per-chunk checksum;
+  * 5-minute validity, nonce-based replay protection;
+  * decoding via `pyzbar` from image files or in-memory PNGs.
 
 ## Setup
 
@@ -313,6 +355,9 @@ On first run, a setup wizard will ask for a master password. On subsequent runs,
 * `Delete` — delete the selected entries
 * `Ctrl+F` — focus the search bar
 * `Ctrl+L` — open the audit log viewer
+* `Ctrl+I` — import vault
+* `Ctrl+Shift+E` — export vault
+* `Ctrl+Shift+O` — open share package
 * `Ctrl+Shift+P` — toggle username visibility
 * `Ctrl+Shift+C` — clear the clipboard
 
@@ -326,7 +371,8 @@ python -m pytest -v
 
 The current test suite covers crypto, key management, vault CRUD,
 search, password generation, clipboard behaviour, audit signing and
-verification, log export, and GUI smoke tests.
+verification, log export, import/export round-trips, sharing, QR
+generation and decoding, and GUI smoke tests.
 
 ## Sprint Roadmap
 
@@ -382,7 +428,7 @@ verification, log export, and GUI smoke tests.
 * platform adapters for Windows (`win32clipboard`) and generic
   (`pyperclip`);
 * background monitor detecting external clipboard changes;
-* integration with the event bus (`ClipboardCopied`, `ClipboardCleared`);
+* integration with the event bus;
 * audit logging of every clipboard operation;
 * toolbar, menu, and context-menu actions for copy / clear;
 * live countdown in the status bar;
@@ -392,30 +438,35 @@ verification, log export, and GUI smoke tests.
 ### Sprint 5 — Audit Logs + Integrity (done)
 
 * separate audit salt and HKDF-derived subkeys for signing and
-  log encryption (key separation);
-* database schema v4 with tamper-evident `audit_log`
-  (sequence number, previous hash, encrypted payload, signature) and
-  `audit_public_key` table;
+  log encryption;
+* database schema v4 with tamper-evident `audit_log` and
+  `audit_public_key`;
 * Ed25519 signatures over each entry's plaintext payload;
-* SHA-256 hash chain linking every entry to its predecessor;
+* SHA-256 hash chain;
 * AES-256-GCM encryption of entry payloads at rest;
-* sanitization of sensitive details (`password`, `encryption_key`, ...)
-  before logging;
-* automatic verification on every successful login (VER-1);
+* sanitization of sensitive details;
+* automatic verification on every successful login;
 * `LogVerifier` with full and range-based verification;
 * audit log viewer with filters, search, details panel, and manual
-  verification (VER-3);
-* export to signed JSON (independently verifiable), CSV, and PDF;
-* `system_startup`, `system_shutdown`, and `tampering_detected` events;
+  verification;
+* export to signed JSON, CSV, and PDF;
 * integration tests for performance, export, recovery, and security.
 
-### Sprint 6 — Encrypted Import/Export
+### Sprint 6 — Encrypted Import/Export + Secure Sharing (done)
 
-* encrypted exports;
-* secure sharing;
-* RSA/ECC-based key exchange/encryption;
-* CSV import;
-* JSON import/export.
+* password-based and public-key encryption for exports
+  (PBKDF2 + AES-256-GCM, RSA-2048-OAEP, ECIES P-256);
+* export formats: CryptoSafe JSON, CSV, Bitwarden JSON, LastPass CSV;
+* field selection, GZIP compression, integrity hash, Ed25519 signature;
+* import with format auto-detection, merge/replace/dry-run modes,
+  duplicate skipping, anti-malware sanitization, size and timeout limits;
+* share packages with permissions, expiration, and recipient metadata;
+* recipient-side import (save or use temporarily);
+* QR codes with chunking, checksum, nonce, and 5-minute validity;
+* GUI dialogs: Export, Import, Sharing, Open Share, QR Viewer;
+* integration into the main window (menu, toolbar, context menu);
+* database schema v5/v6 with `shared_entries`, `import_export_history`,
+  `contacts`.
 
 ### Sprint 7 — Hardening + UX
 
@@ -444,46 +495,38 @@ verification, log export, and GUI smoke tests.
 
 Cryptographic functionality is introduced progressively.
 
-Sprint 1 introduced intentionally insecure placeholders where required by the architecture. Sprint 2 introduced the real master-password and key derivation layer. Sprint 3 replaced the placeholder entry encryption with real AES-256-GCM. Sprint 4 added secure clipboard handling with auto-clear and monitoring. Sprint 5 made the audit log tamper-evident with Ed25519 signatures, a SHA-256 hash chain, and per-entry AES-GCM encryption at rest.
+Sprint 1 introduced intentionally insecure placeholders where required by the architecture. Sprint 2 introduced the real master-password and key derivation layer. Sprint 3 replaced the placeholder entry encryption with real AES-256-GCM. Sprint 4 added secure clipboard handling with auto-clear and monitoring. Sprint 5 made the audit log tamper-evident with Ed25519 signatures, a SHA-256 hash chain, and per-entry AES-GCM encryption at rest. Sprint 6 introduced encrypted import/export, secure sharing, and QR-code key exchange.
 
 The final application uses established cryptographic primitives from maintained libraries rather than custom cryptographic algorithms.
 
 ## Development Status
 
-| Component              | Sprint 1    | Sprint 2          | Sprint 3          | Sprint 4          | Sprint 5          |
-| ---------------------- | ----------- | ----------------- | ----------------- | ----------------- | ----------------- |
-| SQLite database        | Implemented | Implemented       | Implemented       | Implemented       | Implemented       |
-| Schema versioning      | Implemented | Implemented       | Implemented       | Implemented       | Implemented       |
-| Migration system       | Basic       | Implemented       | Implemented       | Implemented       | Implemented       |
-| GUI shell              | Implemented | Implemented       | Implemented       | Implemented       | Implemented       |
-| Settings               | Implemented | Implemented       | Implemented       | Implemented       | Implemented       |
-| Event bus              | Implemented | Implemented       | Implemented       | Implemented       | Implemented       |
-| Key manager            | Stub        | Implemented       | Implemented       | Implemented       | Implemented       |
-| Backup/restore         | Stub        | Stub              | Stub              | Stub              | Stub              |
-| Master password        | Planned     | Implemented       | Implemented       | Implemented       | Implemented       |
-| Argon2id hashing       | Planned     | Implemented       | Implemented       | Implemented       | Implemented       |
-| PBKDF2 key derivation  | Planned     | Implemented       | Implemented       | Implemented       | Implemented       |
-| HKDF key separation    | Planned     | Planned (S5)      | Planned (S5)      | Planned (S5)      | Implemented       |
-| Key caching            | Planned     | Implemented       | Implemented       | Implemented       | Implemented       |
-| Failed-login backoff   | Planned     | Implemented       | Implemented       | Implemented       | Implemented       |
-| Password change        | Planned     | Implemented       | Implemented       | Implemented       | Implemented       |
-| AES-256-GCM (vault)    | Planned     | Planned (S3)      | Implemented       | Implemented       | Implemented       |
-| Vault CRUD             | Planned     | Planned (S3)      | Implemented       | Implemented       | Implemented       |
-| Password generator     | Planned     | Planned (S3)      | Implemented       | Implemented       | Implemented       |
-| Search / filter        | Planned     | Planned (S3)      | Implemented       | Implemented       | Implemented       |
-| Soft delete            | Planned     | Planned (S3)      | Implemented       | Implemented       | Implemented       |
-| Secure clipboard       | Planned     | Planned (S4)      | Planned (S4)      | Implemented       | Implemented       |
-| Clipboard auto-clear   | Planned     | Planned (S4)      | Planned (S4)      | Implemented       | Implemented       |
-| Clipboard monitor      | Planned     | Planned (S4)      | Planned (S4)      | Implemented       | Implemented       |
-| Signed audit log       | Planned     | Planned (S5)      | Planned (S5)      | Planned (S5)      | Implemented       |
-| Hash chain             | Planned     | Planned (S5)      | Planned (S5)      | Planned (S5)      | Implemented       |
-| Audit at-rest encrypt  | Planned     | Planned (S5)      | Planned (S5)      | Planned (S5)      | Implemented       |
-| Audit viewer + verify  | Planned     | Planned (S5)      | Planned (S5)      | Planned (S5)      | Implemented       |
-| Audit export (J/C/PDF) | Planned     | Planned (S5)      | Planned (S5)      | Planned (S5)      | Implemented       |
-| Import/export          | Planned     | Planned (S6)      | Planned (S6)      | Planned (S6)      | Planned (Sprint 6)|
-| Auto-lock              | Planned     | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (Sprint 7)|
-| OS keychain            | Planned     | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (Sprint 7)|
-| Packaging              | Planned     | Planned (S8)      | Planned (S8)      | Planned (S8)      | Planned (Sprint 8)|
+| Component              | Sprint 1    | Sprint 2          | Sprint 3          | Sprint 4          | Sprint 5          | Sprint 6          |
+| ---------------------- | ----------- | ----------------- | ----------------- | ----------------- | ----------------- | ----------------- |
+| SQLite database        | Implemented | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
+| Schema versioning      | Implemented | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
+| Migration system       | Basic       | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
+| GUI shell              | Implemented | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
+| Settings               | Implemented | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
+| Event bus              | Implemented | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
+| Key manager            | Stub        | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
+| Backup/restore         | Stub        | Stub              | Stub              | Stub              | Stub              | Stub              |
+| Master password        | Planned     | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
+| Argon2id hashing       | Planned     | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
+| PBKDF2 key derivation  | Planned     | Implemented       | Implemented       | Implemented       | Implemented       | Implemented       |
+| HKDF key separation    | Planned     | Planned (S5)      | Planned (S5)      | Planned (S5)      | Implemented       | Implemented       |
+| AES-256-GCM (vault)    | Planned     | Planned (S3)      | Implemented       | Implemented       | Implemented       | Implemented       |
+| Vault CRUD             | Planned     | Planned (S3)      | Implemented       | Implemented       | Implemented       | Implemented       |
+| Search / filter        | Planned     | Planned (S3)      | Implemented       | Implemented       | Implemented       | Implemented       |
+| Secure clipboard       | Planned     | Planned (S4)      | Planned (S4)      | Implemented       | Implemented       | Implemented       |
+| Signed audit log       | Planned     | Planned (S5)      | Planned (S5)      | Planned (S5)      | Implemented       | Implemented       |
+| Audit viewer + export  | Planned     | Planned (S5)      | Planned (S5)      | Planned (S5)      | Implemented       | Implemented       |
+| Import / export        | Planned     | Planned (S6)      | Planned (S6)      | Planned (S6)      | Planned (S6)      | Implemented       |
+| Secure sharing         | Planned     | Planned (S6)      | Planned (S6)      | Planned (S6)      | Planned (S6)      | Implemented       |
+| QR key exchange        | Planned     | Planned (S6)      | Planned (S6)      | Planned (S6)      | Planned (S6)      | Implemented       |
+| Auto-lock              | Planned     | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (Sprint 7)|
+| OS keychain            | Planned     | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (S7)      | Planned (Sprint 7)|
+| Packaging              | Planned     | Planned (S8)      | Planned (S8)      | Planned (S8)      | Planned (S8)      | Planned (Sprint 8)|
 
 ## License
 
