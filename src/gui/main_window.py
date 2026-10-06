@@ -7,11 +7,7 @@ Responsible for:
   * running the first-run SetupWizard or the LoginDialog at startup;
   * hosting the main menu, vault table, search bar, and status bar;
   * handling CRUD (Add/Edit/Delete), search, clipboard operations,
-    Lock, Change Password, and Exit actions.
-
-All authentication logic lives in KeyManager. All vault persistence
-lives in EntryManager. All clipboard operations go through
-ClipboardService. This module only wires UI events to service calls.
+    Lock, Change Password, Audit Log, and Exit actions.
 """
 
 from __future__ import annotations
@@ -20,7 +16,8 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from src.core import config
-from src.core.audit_logger import AuditLogger
+from src.core.audit.audit_logger import AuditLogger
+from src.core.audit.log_verifier import LogVerifier
 from src.core.clipboard.clipboard_service import ClipboardService
 from src.core.clipboard.clipboard_settings import (
     load_clipboard_settings,
@@ -40,6 +37,7 @@ from src.core.settings_manager import SettingsManager
 from src.core.vault.entry_manager import EntryManager, VaultError
 from src.core.vault.search import search_entries
 from src.database.db import Database
+from src.gui.audit_log_viewer import AuditLogViewer
 from src.gui.clipboard_settings_dialog import ClipboardSettingsDialog
 from src.gui.entry_dialog import EntryDialog
 from src.gui.login_dialog import LoginDialog
@@ -64,7 +62,7 @@ COLUMN_WIDTHS = {
     "url": 260,
     "updated_at": 160,
 }
-STATUS_REFRESH_MS = 1000  # update clipboard countdown every 1s
+STATUS_REFRESH_MS = 1000
 
 
 class MainWindow(tk.Tk):
@@ -89,6 +87,7 @@ class MainWindow(tk.Tk):
             self.event_bus,
             key_manager=self.key_manager,
         )
+        self.log_verifier = LogVerifier(self.key_manager)
 
         self.entry_manager = EntryManager(
             self.database,
@@ -96,7 +95,6 @@ class MainWindow(tk.Tk):
             event_bus=self.event_bus,
         )
 
-        # Clipboard: load persisted settings and construct the service.
         self._clipboard_settings = load_clipboard_settings(self.settings_manager)
         self.clipboard_service = ClipboardService(
             self.event_bus,
@@ -104,10 +102,7 @@ class MainWindow(tk.Tk):
             on_warning=self._on_clipboard_warning,
         )
 
-        # In-memory cache of decrypted entries (list of dicts).
         self._entries_cache: list[dict] = []
-
-        # Track username visibility (GUI-3 global toggle).
         self._usernames_visible = False
 
         # --- UI -----------------------------------------------------------
@@ -132,11 +127,9 @@ class MainWindow(tk.Tk):
         self.bind("<Control-Shift-P>", lambda _e: self._toggle_usernames())
         self.bind("<Control-f>", lambda _e: self._focus_search())
         self.bind("<Control-Shift-C>", lambda _e: self._clear_clipboard())
+        self.bind("<Control-l>", lambda _e: self._open_audit_log())
 
-        # --- clipboard status refresh loop --------------------------------
         self._schedule_clipboard_status_refresh()
-
-        # --- authentication gate ------------------------------------------
         self.after(100, self._run_auth_gate)
 
     # ------------------------------------------------------------------ #
@@ -157,6 +150,13 @@ class MainWindow(tk.Tk):
 
         self._refresh_status_bar()
         self._refresh_entries()
+        self.audit_logger.log_event(
+            "system_startup",
+            source="main_window",
+            severity="INFO",
+            details={"platform": "desktop"},
+        )
+        self._verify_integrity_on_startup()
 
     def _relock_and_gate(self) -> None:
         dialog = LoginDialog(self, self.key_manager)
@@ -169,11 +169,49 @@ class MainWindow(tk.Tk):
         self._refresh_status_bar()
         self._refresh_entries()
 
+    def _verify_integrity_on_startup(self) -> None:
+        """VER-1: verify audit log integrity on every successful login."""
+        try:
+            report = self.log_verifier.verify_all()
+        except Exception:
+            return
+
+        if not report.verified:
+            first = report.errors[0] if report.errors else None
+            detail = (
+                f"First error: seq {first.sequence_number} — {first.reason}"
+                if first
+                else "Unknown error."
+            )
+            messagebox.showerror(
+                "Audit log integrity",
+                f"Tampering detected in the audit log!\n\n"
+                f"{report.summary()}\n\n{detail}",
+                parent=self,
+            )
+            try:
+                self.audit_logger.log_event(
+                    "tampering_detected",
+                    source="main_window",
+                    severity="CRITICAL",
+                    details={"summary": report.summary()},
+                )
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------ #
     # Shutdown
     # ------------------------------------------------------------------ #
 
     def _shutdown(self) -> None:
+        try:
+            self.audit_logger.log_event(
+                "system_shutdown",
+                source="main_window",
+                severity="INFO",
+            )
+        except Exception:
+            pass
         try:
             self.clipboard_service.clear_if_owned(reason="shutdown")
         except Exception:
@@ -228,7 +266,10 @@ class MainWindow(tk.Tk):
         )
 
         view_menu = tk.Menu(menu_bar, tearoff=False)
-        view_menu.add_command(label="Logs", command=self._not_implemented)
+        view_menu.add_command(
+            label="Audit Log (Ctrl+L)",
+            command=self._open_audit_log,
+        )
         view_menu.add_command(
             label="Toggle Usernames (Ctrl+Shift+P)",
             command=self._toggle_usernames,
@@ -269,29 +310,31 @@ class MainWindow(tk.Tk):
         self.config(menu=menu_bar)
 
     # ------------------------------------------------------------------ #
-    # Toolbar
+    # Toolbar / search / table / context / status
     # ------------------------------------------------------------------ #
+    # (unchanged from Sprint 4 except for new "Logs" button)
 
     def _create_toolbar(self) -> None:
         toolbar = ttk.Frame(self, padding=(10, 6))
         toolbar.pack(fill=tk.X)
 
+        ttk.Button(toolbar, text="+ Add", command=self._add_entry).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="Edit", command=self._edit_selected).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+        ttk.Button(toolbar, text="Delete", command=self._delete_selected).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(
+            side=tk.LEFT, fill=tk.Y, padx=10
+        )
+
         ttk.Button(
-            toolbar,
-            text="+ Add",
-            command=self._add_entry,
+            toolbar, text="Copy Password", command=self._copy_password_selected
         ).pack(side=tk.LEFT)
-
         ttk.Button(
-            toolbar,
-            text="Edit",
-            command=self._edit_selected,
-        ).pack(side=tk.LEFT, padx=(6, 0))
-
-        ttk.Button(
-            toolbar,
-            text="Delete",
-            command=self._delete_selected,
+            toolbar, text="Clear Clipboard", command=self._clear_clipboard
         ).pack(side=tk.LEFT, padx=(6, 0))
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(
@@ -299,36 +342,11 @@ class MainWindow(tk.Tk):
         )
 
         ttk.Button(
-            toolbar,
-            text="Copy Password",
-            command=self._copy_password_selected,
+            toolbar, text="Audit Log", command=self._open_audit_log
         ).pack(side=tk.LEFT)
-
         ttk.Button(
-            toolbar,
-            text="Clear Clipboard",
-            command=self._clear_clipboard,
+            toolbar, text="Refresh", command=self._refresh_entries
         ).pack(side=tk.LEFT, padx=(6, 0))
-
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(
-            side=tk.LEFT, fill=tk.Y, padx=10
-        )
-
-        ttk.Button(
-            toolbar,
-            text="Show/Hide Usernames",
-            command=self._toggle_usernames,
-        ).pack(side=tk.LEFT)
-
-        ttk.Button(
-            toolbar,
-            text="Refresh",
-            command=self._refresh_entries,
-        ).pack(side=tk.LEFT, padx=(6, 0))
-
-    # ------------------------------------------------------------------ #
-    # Search bar
-    # ------------------------------------------------------------------ #
 
     def _create_search_bar(self) -> None:
         bar = ttk.Frame(self, padding=(10, 0))
@@ -355,10 +373,6 @@ class MainWindow(tk.Tk):
             text="Clear",
             command=lambda: self.search_var.set(""),
         ).pack(side=tk.LEFT, padx=(6, 0))
-
-    # ------------------------------------------------------------------ #
-    # Main content (table)
-    # ------------------------------------------------------------------ #
 
     def _create_main_content(self) -> None:
         frame = ttk.Frame(self, padding=10)
@@ -393,27 +407,20 @@ class MainWindow(tk.Tk):
         self.context_menu = tk.Menu(self, tearoff=False)
         self.context_menu.add_command(label="Edit", command=self._edit_selected)
         self.context_menu.add_command(
-            label="Copy Password",
-            command=self._copy_password_selected,
+            label="Copy Password", command=self._copy_password_selected
         )
         self.context_menu.add_command(
-            label="Copy Username",
-            command=self._copy_username_selected,
+            label="Copy Username", command=self._copy_username_selected
         )
         self.context_menu.add_command(
-            label="Copy All",
-            command=self._copy_all_selected,
+            label="Copy All", command=self._copy_all_selected
         )
         self.context_menu.add_separator()
         self.context_menu.add_command(
-            label="Clear Clipboard",
-            command=self._clear_clipboard,
+            label="Clear Clipboard", command=self._clear_clipboard
         )
         self.context_menu.add_separator()
-        self.context_menu.add_command(
-            label="Delete",
-            command=self._delete_selected,
-        )
+        self.context_menu.add_command(label="Delete", command=self._delete_selected)
 
         self.table.bind("<Button-3>", self._show_context_menu)
 
@@ -426,10 +433,6 @@ class MainWindow(tk.Tk):
             finally:
                 self.context_menu.grab_release()
 
-    # ------------------------------------------------------------------ #
-    # Status bar
-    # ------------------------------------------------------------------ #
-
     def _create_status_bar(self) -> None:
         self.status_bar = ttk.Frame(self, relief=tk.SUNKEN)
 
@@ -440,8 +443,7 @@ class MainWindow(tk.Tk):
         self.count_status.pack(side=tk.LEFT, padx=10)
 
         self.clipboard_status = ttk.Label(
-            self.status_bar,
-            text="Clipboard: --",
+            self.status_bar, text="Clipboard: --"
         )
         self.clipboard_status.pack(side=tk.RIGHT, padx=10)
 
@@ -481,7 +483,7 @@ class MainWindow(tk.Tk):
         )
 
     # ------------------------------------------------------------------ #
-    # Entry loading & filtering
+    # Entry loading & filtering (unchanged)
     # ------------------------------------------------------------------ #
 
     def _refresh_entries(self) -> None:
@@ -502,11 +504,7 @@ class MainWindow(tk.Tk):
         fuzzy = self.fuzzy_var.get() if hasattr(self, "fuzzy_var") else False
 
         if query:
-            filtered = search_entries(
-                self._entries_cache,
-                query,
-                fuzzy=fuzzy,
-            )
+            filtered = search_entries(self._entries_cache, query, fuzzy=fuzzy)
         else:
             filtered = list(self._entries_cache)
 
@@ -545,10 +543,6 @@ class MainWindow(tk.Tk):
             return "•" * len(username)
         return username[:4] + "•" * (len(username) - 4)
 
-    # ------------------------------------------------------------------ #
-    # Sorting
-    # ------------------------------------------------------------------ #
-
     def _sort_by(self, column: str) -> None:
         if self._sort_column == column:
             self._sort_reverse = not self._sort_reverse
@@ -556,10 +550,6 @@ class MainWindow(tk.Tk):
             self._sort_column = column
             self._sort_reverse = False
         self._apply_filter()
-
-    # ------------------------------------------------------------------ #
-    # Selection
-    # ------------------------------------------------------------------ #
 
     def _selected_ids(self) -> list[str]:
         return list(self.table.selection())
@@ -573,74 +563,55 @@ class MainWindow(tk.Tk):
                 return entry
         return None
 
-    # ------------------------------------------------------------------ #
-    # CRUD actions
-    # ------------------------------------------------------------------ #
-
     def _require_unlocked(self) -> bool:
         if not self.key_manager.cache.unlocked:
             messagebox.showwarning(
-                "Vault locked",
-                "Unlock the vault first.",
-                parent=self,
+                "Vault locked", "Unlock the vault first.", parent=self
             )
             return False
         return True
 
+    # ------------------------------------------------------------------ #
+    # CRUD (unchanged)
+    # ------------------------------------------------------------------ #
+
     def _add_entry(self) -> None:
         if not self._require_unlocked():
             return
-
         dialog = EntryDialog(self)
         self.wait_window(dialog)
         if dialog.result is None:
             return
-
         try:
             self.entry_manager.create_entry(dialog.result)
         except VaultError as exc:
-            messagebox.showerror(
-                "Failed to create entry",
-                str(exc),
-                parent=self,
-            )
+            messagebox.showerror("Failed to create entry", str(exc), parent=self)
             return
-
         self._refresh_entries()
 
     def _edit_selected(self) -> None:
         if not self._require_unlocked():
             return
-
         entry = self._selected_entry()
         if entry is None:
             return
-
         dialog = EntryDialog(self, entry=entry)
         self.wait_window(dialog)
         if dialog.result is None:
             return
-
         try:
             self.entry_manager.update_entry(entry["id"], dialog.result)
         except VaultError as exc:
-            messagebox.showerror(
-                "Failed to update entry",
-                str(exc),
-                parent=self,
-            )
+            messagebox.showerror("Failed to update entry", str(exc), parent=self)
             return
-
         self._refresh_entries()
 
     def _delete_selected(self) -> None:
         if not self._require_unlocked():
             return
-
         ids = self._selected_ids()
         if not ids:
             return
-
         count = len(ids)
         if not messagebox.askyesno(
             "Delete entries",
@@ -648,17 +619,15 @@ class MainWindow(tk.Tk):
             parent=self,
         ):
             return
-
         for entry_id in ids:
             try:
                 self.entry_manager.delete_entry(entry_id, soft_delete=True)
             except VaultError:
                 continue
-
         self._refresh_entries()
 
     # ------------------------------------------------------------------ #
-    # Clipboard actions (Sprint 4)
+    # Clipboard (unchanged)
     # ------------------------------------------------------------------ #
 
     def _copy_password_selected(self) -> None:
@@ -667,11 +636,7 @@ class MainWindow(tk.Tk):
         entry = self._selected_entry()
         if entry is None:
             return
-        self._copy_value(
-            str(entry.get("password", "")),
-            data_type="password",
-            entry_id=entry["id"],
-        )
+        self._copy_value(str(entry.get("password", "")), "password", entry["id"])
 
     def _copy_username_selected(self) -> None:
         if not self._require_unlocked():
@@ -679,11 +644,7 @@ class MainWindow(tk.Tk):
         entry = self._selected_entry()
         if entry is None:
             return
-        self._copy_value(
-            str(entry.get("username", "")),
-            data_type="username",
-            entry_id=entry["id"],
-        )
+        self._copy_value(str(entry.get("username", "")), "username", entry["id"])
 
     def _copy_all_selected(self) -> None:
         if not self._require_unlocked():
@@ -698,31 +659,18 @@ class MainWindow(tk.Tk):
             f"URL: {entry.get('url', '')}\n"
             f"Notes: {entry.get('notes', '')}"
         )
-        self._copy_value(
-            combined,
-            data_type="entry",
-            entry_id=entry["id"],
-        )
+        self._copy_value(combined, "entry", entry["id"])
 
-    def _copy_value(
-        self,
-        value: str,
-        *,
-        data_type: str,
-        entry_id: str | None,
-    ) -> None:
+    def _copy_value(self, value: str, data_type: str, entry_id: str | None) -> None:
         if not value:
             return
         ok = self.clipboard_service.copy(
-            value,
-            data_type=data_type,
-            source_entry_id=entry_id,
+            value, data_type=data_type, source_entry_id=entry_id
         )
         if not ok:
             messagebox.showwarning(
                 "Copy failed",
-                "Could not write to the system clipboard. "
-                "Another application may be holding it.",
+                "Could not write to the system clipboard.",
                 parent=self,
             )
 
@@ -730,8 +678,6 @@ class MainWindow(tk.Tk):
         self.clipboard_service.clear(reason="manual")
 
     def _on_clipboard_warning(self, seconds: float) -> None:
-        # Called by ClipboardService before auto-clear.
-        # We use a lightweight status message instead of a modal dialog.
         try:
             self.clipboard_status.configure(
                 text=f"Clipboard: clearing in {int(seconds)}s"
@@ -755,18 +701,13 @@ class MainWindow(tk.Tk):
     # ------------------------------------------------------------------ #
 
     def _open_settings(self) -> None:
-        dialog = SettingsDialog(
-            self,
-            settings_manager=self.settings_manager,
-        )
+        dialog = SettingsDialog(self, settings_manager=self.settings_manager)
         self.wait_window(dialog)
 
     def _open_clipboard_settings(self) -> None:
         dialog = ClipboardSettingsDialog(self, self.settings_manager)
         self.wait_window(dialog)
-
         if dialog.result is not None:
-            # Apply new timeout to the running service.
             self.clipboard_service.set_timeout(dialog.result.timeout)
             self._clipboard_settings = dialog.result
 
@@ -780,14 +721,17 @@ class MainWindow(tk.Tk):
                 parent=self,
             )
             return
-
         dialog = ChangePasswordDialog(self, self.key_manager)
         self.wait_window(dialog)
 
-    def _lock_vault(self) -> None:
-        # SEC-3: clear the clipboard immediately on lock.
-        self.clipboard_service.clear_if_owned(reason="lock")
+    def _open_audit_log(self) -> None:
+        if not self._require_unlocked():
+            return
+        viewer = AuditLogViewer(self, self.database, self.key_manager)
+        self.wait_window(viewer)
 
+    def _lock_vault(self) -> None:
+        self.clipboard_service.clear_if_owned(reason="lock")
         self.key_manager.lock(reason="manual")
         self._entries_cache = []
         self.table.delete(*self.table.get_children())
@@ -801,7 +745,7 @@ class MainWindow(tk.Tk):
             "About CryptoSafe Manager",
             "CryptoSafe Manager\n"
             "Secure local password manager\n"
-            "Sprint 4 development build",
+            "Sprint 5 development build",
         )
 
     # ------------------------------------------------------------------ #
